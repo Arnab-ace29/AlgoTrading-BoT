@@ -75,6 +75,37 @@ python moneycontrol_dividends.py --push-only --json-path backup/moneycontrol_cor
 ```
 Regenerates fresh JSON backups from the current Mongo cache while leaving the database untouched.
 
+### Push Existing Mongo Snapshot (no writes)
+`ash
+python moneycontrol_dividends.py --push-only
+`
+Loads data from Mongo (or JSON backup if Mongo is empty) and exits without rewriting either store. Good for sanity-checking the cached dataset.
+
+### Push Existing JSON Backup to Mongo
+`ash
+python moneycontrol_dividends.py --push-only --json-path Historic Data/moneycontrol_corporate_actions.json --push-to-mongo
+`
+Replays the JSON backup into MongoDB?ideal when you import the project on a new machine and want Mongo to match the shipped snapshot.
+
+### Inspect Metadata Without Corporate Sections
+`ash
+python moneycontrol_dividends.py --only SBIN,TCS --refresh-details --push-only
+`
+Refreshes identifiers for selected stocks and updates JSON/Mongo metadata without touching corporate-action sections. Useful for symbol verification scripts.
+
+## FAQ
+**Why keep JSON and Mongo?**
+Mongo stores the canonical dataset for distributed use, while JSON snapshots remain easy to diff, share, or inspect offline.
+
+**What happens if JSON files are deleted?**
+The scraper pulls everything from Mongo on the next run. If Mongo is also empty, use --refresh-metadata and --refresh-details to rebuild from the APIs.
+
+**How are duplicates avoided?**
+Per-section pagination stops once existing entries are detected, and section payloads are normalised to a single list key (e.g. d["dividend"]).
+
+**Do SC_ prefixed keys exist in Mongo?**
+No. Keys like SC_ISINID are stored without the prefix (e.g. ISINID) for easier querying. When exporting to JSON, the script restores the original names for compatibility.
+
 ## JSON Backups
 - `Historic Data/moneycontrol_stock_metadata.json`
 - `Historic Data/moneycontrol_corporate_actions.json`

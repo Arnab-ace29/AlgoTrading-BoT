@@ -29,6 +29,8 @@ DETAIL_DELAY = 0.1
 MAX_RETRIES = 3
 DEFAULT_CHUNK_SIZE = 50
 DEFAULT_MONGO_URI = "mongodb://localhost:27017"
+DEFAULT_METADATA_COLLECTION = "stock_metadata"
+
 DETAIL_KEYS: Tuple[str, ...] = (
     "SC_ISINID",
     "SC_BSEID",
@@ -36,13 +38,22 @@ DETAIL_KEYS: Tuple[str, ...] = (
     "SC_NSEID",
     "SC_TICKERNAME",
 )
-
+DETAIL_TRIM_MAP: Dict[str, str] = {key[3:]: key for key in DETAIL_KEYS}
+METADATA_BASE_KEYS: Tuple[str, ...] = (
+    "id",
+    "did",
+    "shortName",
+    "name",
+    "productCategory",
+    "marketcap",
+)
+METADATA_EXPORT_KEYS: Tuple[str, ...] = METADATA_BASE_KEYS + DETAIL_KEYS
 
 # Mapping API sections to their list payload keys and desired JSON key names.
-SECTION_SPECS: Dict[str, Dict[str, object]] = {
+SECTION_SPECS: Dict[str, Dict[str, str]] = {
     "an": {"list_field": "announcement", "result_key": "announcement"},
     "bm": {"list_field": "board_meeting", "result_key": "board_meeting"},
-    "d": {"list_field": "dividends", "result_key": "dividend", "aliases": ("dividends",)},
+    "d": {"list_field": "dividends", "result_key": "dividend"},
     "s": {"list_field": "splits", "result_key": "splits"},
     "r": {"list_field": "rights", "result_key": "rights"},
     "ae": {"list_field": "agm_egm", "result_key": "agm_egm"},
@@ -200,8 +211,7 @@ def extract_existing_items(existing_section: Optional[Dict[str, object]], sectio
     spec = SECTION_SPECS[section]
     list_field = spec["list_field"]
     result_key = spec["result_key"]
-    aliases = tuple(spec.get("aliases", ()))
-    for key in (result_key, list_field, *aliases):
+    for key in (result_key, list_field):
         items = existing_section.get(key)
         if isinstance(items, list):
             return items
@@ -212,14 +222,23 @@ def empty_section_payload(section: str) -> Dict[str, object]:
     """Build a placeholder payload when a section is skipped or unavailable."""
     spec = SECTION_SPECS[section]
     result_key = spec["result_key"]
-    base_list: List[Dict[str, object]] = []
-    payload: Dict[str, object] = {result_key: base_list}
-    for alias in spec.get("aliases", ()):  # Mirror aliases so callers can use either key.
-        payload[alias] = base_list
+    payload: Dict[str, object] = {result_key: []}
     payload["pageCount"] = 0
     payload["pagesFetched"] = 0
     payload["newItems"] = 0
     payload["existingItems"] = 0
+    return payload
+
+
+def normalize_section_payload(section: str, payload: Dict[str, object]) -> Dict[str, object]:
+    """Normalize legacy keys within a section payload."""
+    spec = SECTION_SPECS[section]
+    list_field = spec["list_field"]
+    result_key = spec["result_key"]
+    if result_key not in payload and list_field in payload:
+        payload[result_key] = payload[list_field]
+    if list_field in payload and list_field != result_key:
+        payload.pop(list_field, None)
     return payload
 
 
@@ -233,13 +252,12 @@ def fetch_corporate_section(
     spec = SECTION_SPECS[section]
     list_field = spec["list_field"]
     result_key = spec["result_key"]
-    aliases = tuple(spec.get("aliases", ()))
 
     existing_items = extract_existing_items(existing_section, section)
     existing_fingerprints = {json.dumps(entry, sort_keys=True) for entry in existing_items if isinstance(entry, dict)}
 
     new_items: List[Dict[str, object]] = []
-    seen: set[str] = set(existing_fingerprints)
+    seen: Set[str] = set(existing_fingerprints)
     page = 1
     pages_fetched = 0
     last_page_count: Optional[int] = None
@@ -289,8 +307,6 @@ def fetch_corporate_section(
     combined_items = new_items + existing_items
 
     section_payload: Dict[str, object] = {result_key: combined_items}
-    for alias in aliases:
-        section_payload[alias] = combined_items
     if last_page_count is not None:
         section_payload["pageCount"] = last_page_count
     section_payload["pagesFetched"] = pages_fetched
@@ -299,54 +315,111 @@ def fetch_corporate_section(
     return section_payload
 
 
-def load_existing_output(path: Path) -> Dict[str, Dict[str, object]]:
-    """Load the previous JSON file so we can merge new results with historic data."""
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"Unable to load existing corporate actions: {exc}")
-        return {}
+def restore_detail_keys(document: Dict[str, object]) -> None:
+    """Re-introduce SC_ prefixed detail keys when loading from Mongo."""
+    for trimmed, original in DETAIL_TRIM_MAP.items():
+        if trimmed in document:
+            if original not in document:
+                document[original] = document[trimmed]
+            document.pop(trimmed, None)
+
+
+def normalize_corporate_entry(entry: Dict[str, object]) -> Dict[str, object]:
+    """Clean legacy keys within a corporate action entry."""
+    restore_detail_keys(entry)
+    for section_code in SECTION_SPECS:
+        payload = entry.get(section_code)
+        if isinstance(payload, dict):
+            entry[section_code] = normalize_section_payload(section_code, payload)
+    return entry
+
+
+def prepare_document_for_mongo(document: Dict[str, object]) -> Dict[str, object]:
+    """Strip the SC_ prefix from detail keys before persisting to Mongo."""
+    prepared: Dict[str, object] = {}
+    for key, value in document.items():
+        new_key = key[3:] if key.startswith("SC_") else key
+        if isinstance(value, dict) and key in SECTION_SPECS:
+            prepared[new_key] = prepare_document_for_mongo(value)  # recurse for section payloads
+        else:
+            prepared[new_key] = value
+    return prepared
+
+
+def load_existing_output(path: Path, collection: Optional[Collection]) -> Dict[str, Dict[str, object]]:
+    """Load corporate actions from Mongo (preferred) or JSON backup."""
     indexed: Dict[str, Dict[str, object]] = {}
-    if isinstance(payload, list):
-        for entry in payload:
-            if isinstance(entry, dict) and entry.get("id"):
-                indexed[str(entry["id"])] = entry
+    records: List[Dict[str, object]] = []
+    if collection is not None:
+        try:
+            records = list(collection.find({}, {"_id": False}))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Unable to fetch corporate actions from Mongo: {exc}")
+    if not records and path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                records = payload
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Unable to load existing corporate actions: {exc}")
+    for entry in records:
+        if not isinstance(entry, dict):
+            continue
+        entry = normalize_corporate_entry(dict(entry))
+        stock_id = entry.get("id")
+        if not stock_id:
+            continue
+        indexed[str(stock_id)] = entry
     return indexed
 
 
-def load_existing_metadata(path: Path) -> Dict[str, Dict[str, object]]:
-    """Load the cached metadata file and index it by stock id."""
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"Unable to load existing metadata: {exc}")
-        return {}
-    records: Dict[str, Dict[str, object]] = {}
-    if isinstance(payload, list):
-        for entry in payload:
-            if isinstance(entry, dict) and entry.get("id"):
-                records[str(entry["id"])] = entry
-    return records
+def load_existing_metadata(path: Path, collection: Optional[Collection]) -> Dict[str, Dict[str, object]]:
+    """Load metadata from Mongo (preferred) or JSON backup."""
+    records: List[Dict[str, object]] = []
+    if collection is not None:
+        try:
+            records = list(collection.find({}, {"_id": False}))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Unable to fetch metadata from Mongo: {exc}")
+    if not records and path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                records = payload
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Unable to load existing metadata: {exc}")
+    indexed: Dict[str, Dict[str, object]] = {}
+    for entry in records:
+        if not isinstance(entry, dict):
+            continue
+        restore_detail_keys(entry)
+        stock_id = entry.get("id")
+        if not stock_id:
+            continue
+        indexed[str(stock_id)] = dict(entry)
+    return indexed
 
 
-def load_corporate_payload(path: Path) -> List[Dict[str, object]]:
-    """Load the corporate action JSON file into memory."""
-    if not path.exists():
-        print(f"Corporate action file not found at {path}")
-        return []
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"Unable to load corporate actions JSON: {exc}")
-        return []
-    if not isinstance(payload, list):
-        print("Corporate actions JSON is not a list; skipping push")
-        return []
-    return payload
+def load_corporate_payload(path: Path, collection: Optional[Collection]) -> List[Dict[str, object]]:
+    """Load the corporate action list from Mongo (preferred) or JSON backup."""
+    records: List[Dict[str, object]] = []
+    if collection is not None:
+        try:
+            records = list(collection.find({}, {"_id": False}))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Unable to fetch corporate payload from Mongo: {exc}")
+    if not records and path.exists():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                records = payload
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Unable to load corporate actions JSON: {exc}")
+    cleaned: List[Dict[str, object]] = []
+    for entry in records:
+        if isinstance(entry, dict):
+            cleaned.append(normalize_corporate_entry(dict(entry)))
+    return cleaned
 
 
 def parse_only_arg(raw_only: Optional[str]) -> Tuple[Set[str], Set[str]]:
@@ -390,34 +463,24 @@ def iter_chunks(items: Iterable[Dict[str, object]], chunk_size: int) -> Iterable
 
 def ensure_indexes(collection: Collection) -> None:
     """Create the optimal index set for quick id-based upserts if missing."""
-    if collection is None:  # pragma: no cover - defensive.
+    if collection is None:
         return
     indexes = collection.index_information()
     if "id_1" not in indexes:
         collection.create_index("id", unique=True, name="id_1")
 
 
-def prepare_document_for_mongo(document: Dict[str, object]) -> Dict[str, object]:
-    """Strip the SC_ prefix from detail keys before persisting to Mongo."""
-    prepared: Dict[str, object] = {}
-    for key, value in document.items():
-        new_key = key[3:] if key.startswith("SC_") else key
-        prepared[new_key] = value
-    return prepared
-
-
 def push_documents_to_mongo(
     documents: List[Dict[str, object]],
-    mongo_uri: str,
+    client: MongoClient,
     database: str,
     collection_name: str,
     chunk_size: int,
 ) -> None:
     """Stream documents into MongoDB in chunky upserts for resilience."""
-    if MongoClient is None or UpdateOne is None:
+    if client is None or UpdateOne is None:
         raise RuntimeError("pymongo is required to push data to MongoDB. Install it via 'pip install pymongo'.")
 
-    client = MongoClient(mongo_uri)
     collection: Collection = client[database][collection_name]
     ensure_indexes(collection)
 
@@ -442,11 +505,66 @@ def push_documents_to_mongo(
         print(f"Mongo upserted batch, total processed: {processed}/{total_documents}")
 
 
+def push_metadata_to_mongo(
+    metadata: Dict[str, Dict[str, object]],
+    client: MongoClient,
+    database: str,
+    collection_name: str,
+    chunk_size: int,
+) -> None:
+    """Upsert metadata records into MongoDB."""
+    if client is None or UpdateOne is None:
+        raise RuntimeError("pymongo is required to push metadata to MongoDB. Install it via 'pip install pymongo'.")
+
+    collection: Collection = client[database][collection_name]
+    ensure_indexes(collection)
+
+    records = list(metadata.values())
+    total = len(records)
+    processed = 0
+    for chunk in iter_chunks(records, chunk_size):
+        operations = []
+        for record in chunk:
+            doc_id = record.get("id")
+            if not doc_id:
+                continue
+            prepared = prepare_document_for_mongo(record)
+            operations.append(UpdateOne({"id": doc_id}, {"$set": prepared}, upsert=True))
+        if not operations:
+            continue
+        try:
+            collection.bulk_write(operations, ordered=False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Mongo metadata bulk_write failed: {exc}")
+            continue
+        processed += len(operations)
+        print(f"Mongo upserted metadata batch, total processed: {processed}/{total}")
+
+
 def filter_payload_by_stocks(payload: List[Dict[str, object]], stock_ids: Set[str]) -> List[Dict[str, object]]:
     """Restrict the payload to a subset of stock identifiers if requested."""
     if not stock_ids:
         return payload
     return [entry for entry in payload if entry.get("id") in stock_ids]
+
+
+def extract_metadata_from_entry(entry: Dict[str, object]) -> Dict[str, object]:
+    """Build a metadata record from a corporate action entry."""
+    return {key: entry.get(key) for key in METADATA_EXPORT_KEYS if key in entry}
+
+
+def get_mongo_collections(args: argparse.Namespace) -> Tuple[Optional[MongoClient], Optional[Collection], Optional[Collection]]:
+    """Establish Mongo connections for metadata and corporate collections."""
+    if MongoClient is None:
+        return None, None, None
+    try:
+        client = MongoClient(args.mongo_uri)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Mongo connection failed: {exc}")
+        return None, None, None
+    corporate_collection = client[args.mongo_db][args.mongo_collection]
+    metadata_collection = client[args.mongo_db][args.mongo_metadata_collection]
+    return client, metadata_collection, corporate_collection
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -455,7 +573,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument(
         "--refresh-metadata",
         action="store_true",
-        help="Re-scrape stock metadata instead of using the cached JSON",
+        help="Re-scrape stock metadata instead of using cached/Mongo data",
     )
     parser.add_argument(
         "--refresh-details",
@@ -469,7 +587,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument(
         "--push-only",
         action="store_true",
-        help="Skip scraping and push the existing JSON payload to MongoDB",
+        help="Skip scraping and operate on existing Mongo/JSON payload",
     )
     parser.add_argument(
         "--json-path",
@@ -482,7 +600,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     parser.add_argument("--mongo-uri", default=DEFAULT_MONGO_URI, help="MongoDB connection string")
     parser.add_argument("--mongo-db", default="moneycontrol", help="MongoDB database name")
-    parser.add_argument("--mongo-collection", default="corporate_actions", help="MongoDB collection name")
+    parser.add_argument(
+        "--mongo-collection",
+        default="corporate_actions",
+        help="MongoDB collection name for corporate actions",
+    )
+    parser.add_argument(
+        "--mongo-metadata-collection",
+        default=DEFAULT_METADATA_COLLECTION,
+        help="MongoDB collection name for stock metadata",
+    )
     parser.add_argument(
         "--chunk-size",
         type=int,
@@ -505,22 +632,27 @@ def main(argv: Optional[List[str]] = None) -> None:
         Path(args.json_path).resolve() if args.json_path else output_dir / "moneycontrol_corporate_actions.json"
     )
 
+    mongo_client, metadata_collection, corporate_collection = get_mongo_collections(args)
+
     session = requests.Session()
 
     corporate_payload: List[Dict[str, object]] = []
+    payload_for_push: List[Dict[str, object]] = []
 
     if args.push_only:
-        corporate_payload = load_corporate_payload(corporate_output_path)
-        metadata_records = load_existing_metadata(stock_metadata_path)
+        corporate_payload = load_corporate_payload(corporate_output_path, corporate_collection)
+        metadata_records = load_existing_metadata(stock_metadata_path, metadata_collection)
         if args.refresh_details and corporate_payload:
             metadata_updated = False
             for entry in corporate_payload:
                 if update_record_with_details(session, entry, force_refresh=True):
                     metadata_updated = True
-                    stock_id = entry.get("id")
-                    if stock_id and stock_id in metadata_records:
-                        for key in DETAIL_KEYS:
-                            metadata_records[stock_id][key] = entry.get(key)
+                stock_id = entry.get("id")
+                if stock_id:
+                    if stock_id not in metadata_records:
+                        metadata_records[stock_id] = extract_metadata_from_entry(entry)
+                    else:
+                        metadata_records[stock_id].update(extract_metadata_from_entry(entry))
             if metadata_updated:
                 if metadata_records:
                     stock_metadata_path.write_text(
@@ -528,16 +660,23 @@ def main(argv: Optional[List[str]] = None) -> None:
                         encoding="utf-8",
                     )
                 corporate_output_path.write_text(json.dumps(corporate_payload, indent=2), encoding="utf-8")
-
-        payload_for_push = filter_payload_by_stocks(
-            corporate_payload,
-            requested_stock_ids,
-        )
+        elif not metadata_records and corporate_payload:
+            metadata_records = {
+                entry["id"]: extract_metadata_from_entry(entry)
+                for entry in corporate_payload
+                if entry.get("id")
+            }
+            if metadata_records:
+                stock_metadata_path.write_text(
+                    json.dumps(list(metadata_records.values()), indent=2),
+                    encoding="utf-8",
+                )
+        payload_for_push = filter_payload_by_stocks(corporate_payload, requested_stock_ids)
+        metadata_cache = metadata_records
     else:
-        metadata_cache = load_existing_metadata(stock_metadata_path)
+        metadata_cache = load_existing_metadata(stock_metadata_path, metadata_collection)
         if args.refresh_metadata or not metadata_cache:
             metadata_cache = fetch_stock_metadata(session)
-
         if requested_stock_ids:
             missing = [stock_id for stock_id in requested_stock_ids if stock_id not in metadata_cache]
             if missing:
@@ -546,17 +685,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         else:
             stocks_to_process = metadata_cache
 
-        existing_by_id = load_existing_output(corporate_output_path)
+        existing_by_id = load_existing_output(corporate_output_path, corporate_collection)
         processed_ids: Set[str] = set()
 
         for index, (stock_id, stock_info) in enumerate(stocks_to_process.items(), start=1):
             prior_entry = existing_by_id.get(stock_id)
-            if update_record_with_details(
+            update_record_with_details(
                 session,
                 stock_info,
                 force_refresh=args.refresh_details,
-            ):
-                pass
+            )
             sections_payload: Dict[str, Dict[str, object]] = {}
             should_update_stock = not requested_stock_ids or stock_id in requested_stock_ids
             for section_code in SECTION_SPECS:
@@ -596,11 +734,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         payload_for_push = filter_payload_by_stocks(corporate_payload, requested_stock_ids)
 
     if args.push_to_mongo:
-        if args.push_only and not payload_for_push:
-            payload_for_push = filter_payload_by_stocks(
-                corporate_payload,
-                requested_stock_ids,
-            )
+        if not payload_for_push:
+            payload_for_push = filter_payload_by_stocks(corporate_payload, requested_stock_ids)
         if not payload_for_push:
             print("No corporate action data available to push to MongoDB")
         else:
@@ -610,11 +745,26 @@ def main(argv: Optional[List[str]] = None) -> None:
             )
             push_documents_to_mongo(
                 payload_for_push,
-                args.mongo_uri,
+                mongo_client,
                 args.mongo_db,
                 args.mongo_collection,
                 args.chunk_size,
             )
+        if metadata_cache:
+            print(
+                f"Pushing {len(metadata_cache)} metadata records to MongoDB collection "
+                f"{args.mongo_db}.{args.mongo_metadata_collection}"
+            )
+            push_metadata_to_mongo(
+                metadata_cache,
+                mongo_client,
+                args.mongo_db,
+                args.mongo_metadata_collection,
+                args.chunk_size,
+            )
+
+    if mongo_client is not None:
+        mongo_client.close()
 
 
 if __name__ == "__main__":

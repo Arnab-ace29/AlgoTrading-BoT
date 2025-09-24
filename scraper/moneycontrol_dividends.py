@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - handled at runtime.
 
 SEARCH_URL = "https://api.moneycontrol.com/mcapi/v1/stock/search"
 CORPORATE_ACTION_URL = "https://api.moneycontrol.com/mcapi/v1/stock/corporate-action"
+STOCK_DETAILS_URL = "https://api.moneycontrol.com/mcapi/v1/stock/scmas-details"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PythonScript",
     "Accept": "application/json",
@@ -24,9 +25,17 @@ HEADERS = {
 SEARCH_DELAY = 0.12
 SECTION_DELAY = 0.12
 PAGE_DELAY = 0.12
+DETAIL_DELAY = 0.1
 MAX_RETRIES = 3
 DEFAULT_CHUNK_SIZE = 50
 DEFAULT_MONGO_URI = "mongodb://localhost:27017"
+DETAIL_KEYS: Tuple[str, ...] = (
+    "SC_ISINID",
+    "SC_BSEID",
+    "SC_NOSHR",
+    "SC_NSEID",
+    "SC_TICKERNAME",
+)
 
 
 # Mapping API sections to their list payload keys and desired JSON key names.
@@ -78,6 +87,64 @@ def fetch_stock_metadata(session: requests.Session) -> Dict[str, Dict[str, objec
             }
         throttle(SEARCH_DELAY)
     return records
+
+
+def fetch_stock_details(
+    session: requests.Session,
+    sc_id: str,
+    existing_details: Optional[Dict[str, object]] = None,
+    force_refresh: bool = False,
+) -> Dict[str, object]:
+    """Retrieve extended symbol identifiers and cache them when available."""
+    existing_details = existing_details or {}
+    if not force_refresh:
+        if all(existing_details.get(key) not in (None, "") for key in DETAIL_KEYS):
+            return {key: existing_details.get(key) for key in DETAIL_KEYS}
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = session.get(
+                STOCK_DETAILS_URL,
+                params={"scId": sc_id},
+                headers=HEADERS,
+                timeout=20,
+            )
+            if response.status_code == 404:
+                throttle(DETAIL_DELAY)
+                return existing_details
+            response.raise_for_status()
+            payload = response.json()
+            throttle(DETAIL_DELAY)
+            break
+        except Exception as exc:  # noqa: BLE001
+            if attempt == MAX_RETRIES:
+                print(f"Failed to fetch detail record for {sc_id}: {exc}")
+                return existing_details
+            throttle(0.5 * attempt)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return existing_details
+    details = {key: data.get(key) for key in DETAIL_KEYS}
+    return details
+
+
+def update_record_with_details(
+    session: requests.Session,
+    record: Dict[str, object],
+    force_refresh: bool = False,
+) -> bool:
+    """Ensure the record contains the requested SC_* detail fields."""
+    sc_id = record.get("id")
+    if not sc_id:
+        return False
+    existing_details = {key: record.get(key) for key in DETAIL_KEYS}
+    details = fetch_stock_details(session, sc_id, existing_details, force_refresh=force_refresh)
+    changed = False
+    for key in DETAIL_KEYS:
+        value = details.get(key)
+        if record.get(key) != value:
+            record[key] = value
+            changed = True
+    return changed
 
 
 def request_corporate_page(
@@ -330,6 +397,15 @@ def ensure_indexes(collection: Collection) -> None:
         collection.create_index("id", unique=True, name="id_1")
 
 
+def prepare_document_for_mongo(document: Dict[str, object]) -> Dict[str, object]:
+    """Strip the SC_ prefix from detail keys before persisting to Mongo."""
+    prepared: Dict[str, object] = {}
+    for key, value in document.items():
+        new_key = key[3:] if key.startswith("SC_") else key
+        prepared[new_key] = value
+    return prepared
+
+
 def push_documents_to_mongo(
     documents: List[Dict[str, object]],
     mongo_uri: str,
@@ -353,7 +429,8 @@ def push_documents_to_mongo(
             doc_id = doc.get("id")
             if not doc_id:
                 continue
-            operations.append(UpdateOne({"id": doc_id}, {"$set": doc}, upsert=True))
+            prepared_doc = prepare_document_for_mongo(doc)
+            operations.append(UpdateOne({"id": doc_id}, {"$set": prepared_doc}, upsert=True))
         if not operations:
             continue
         try:
@@ -379,6 +456,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--refresh-metadata",
         action="store_true",
         help="Re-scrape stock metadata instead of using the cached JSON",
+    )
+    parser.add_argument(
+        "--refresh-details",
+        action="store_true",
+        help="Force refresh of symbol detail identifiers (SC_*) even if cached",
     )
     parser.add_argument(
         "--only",
@@ -429,30 +511,52 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.push_only:
         corporate_payload = load_corporate_payload(corporate_output_path)
-        if requested_stock_ids:
-            corporate_payload = filter_payload_by_stocks(corporate_payload, requested_stock_ids)
+        metadata_records = load_existing_metadata(stock_metadata_path)
+        if args.refresh_details and corporate_payload:
+            metadata_updated = False
+            for entry in corporate_payload:
+                if update_record_with_details(session, entry, force_refresh=True):
+                    metadata_updated = True
+                    stock_id = entry.get("id")
+                    if stock_id and stock_id in metadata_records:
+                        for key in DETAIL_KEYS:
+                            metadata_records[stock_id][key] = entry.get(key)
+            if metadata_updated:
+                if metadata_records:
+                    stock_metadata_path.write_text(
+                        json.dumps(list(metadata_records.values()), indent=2),
+                        encoding="utf-8",
+                    )
+                corporate_output_path.write_text(json.dumps(corporate_payload, indent=2), encoding="utf-8")
+
+        payload_for_push = filter_payload_by_stocks(
+            corporate_payload,
+            requested_stock_ids,
+        )
     else:
-        stocks: Dict[str, Dict[str, object]]
-        if args.refresh_metadata:
-            stocks = fetch_stock_metadata(session)
-            stock_metadata_path.write_text(json.dumps(list(stocks.values()), indent=2), encoding="utf-8")
-        else:
-            stocks = load_existing_metadata(stock_metadata_path)
-            if not stocks:
-                stocks = fetch_stock_metadata(session)
-                stock_metadata_path.write_text(json.dumps(list(stocks.values()), indent=2), encoding="utf-8")
+        metadata_cache = load_existing_metadata(stock_metadata_path)
+        if args.refresh_metadata or not metadata_cache:
+            metadata_cache = fetch_stock_metadata(session)
 
         if requested_stock_ids:
-            missing = [stock_id for stock_id in requested_stock_ids if stock_id not in stocks]
+            missing = [stock_id for stock_id in requested_stock_ids if stock_id not in metadata_cache]
             if missing:
                 print(f"Warning: requested stock ids missing from metadata: {', '.join(missing)}")
-            stocks = {stock_id: stocks[stock_id] for stock_id in requested_stock_ids if stock_id in stocks}
+            stocks_to_process = {sid: metadata_cache[sid] for sid in requested_stock_ids if sid in metadata_cache}
+        else:
+            stocks_to_process = metadata_cache
 
         existing_by_id = load_existing_output(corporate_output_path)
         processed_ids: Set[str] = set()
 
-        for index, (stock_id, stock_info) in enumerate(stocks.items(), start=1):
+        for index, (stock_id, stock_info) in enumerate(stocks_to_process.items(), start=1):
             prior_entry = existing_by_id.get(stock_id)
+            if update_record_with_details(
+                session,
+                stock_info,
+                force_refresh=args.refresh_details,
+            ):
+                pass
             sections_payload: Dict[str, Dict[str, object]] = {}
             should_update_stock = not requested_stock_ids or stock_id in requested_stock_ids
             for section_code in SECTION_SPECS:
@@ -484,20 +588,28 @@ def main(argv: Optional[List[str]] = None) -> None:
             corporate_payload.append(prior_entry)
 
         corporate_output_path.write_text(json.dumps(corporate_payload, indent=2), encoding="utf-8")
+        stock_metadata_path.write_text(
+            json.dumps(list(metadata_cache.values()), indent=2),
+            encoding="utf-8",
+        )
+
+        payload_for_push = filter_payload_by_stocks(corporate_payload, requested_stock_ids)
 
     if args.push_to_mongo:
-        if not corporate_payload:
-            corporate_payload = load_corporate_payload(corporate_output_path)
-        if not corporate_payload:
+        if args.push_only and not payload_for_push:
+            payload_for_push = filter_payload_by_stocks(
+                corporate_payload,
+                requested_stock_ids,
+            )
+        if not payload_for_push:
             print("No corporate action data available to push to MongoDB")
         else:
-            filtered_payload = filter_payload_by_stocks(corporate_payload, requested_stock_ids)
             print(
-                f"Pushing {len(filtered_payload)} documents to MongoDB collection "
+                f"Pushing {len(payload_for_push)} documents to MongoDB collection "
                 f"{args.mongo_db}.{args.mongo_collection} in chunks of {args.chunk_size}"
             )
             push_documents_to_mongo(
-                filtered_payload,
+                payload_for_push,
                 args.mongo_uri,
                 args.mongo_db,
                 args.mongo_collection,

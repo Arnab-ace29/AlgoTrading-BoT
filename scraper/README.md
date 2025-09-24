@@ -1,12 +1,13 @@
-# Moneycontrol Corporate Actions Scraper
+﻿# Moneycontrol Corporate Actions Scraper
 
 This project scrapes corporate-action data (announcements, board meetings, dividends, splits, rights issues, and AGM/EGM notices) from the Moneycontrol public API, stores the results as JSON, and can stream updates into a local MongoDB collection.
 
 ## Features
 - Crawls Moneycontrol's stock directory (0-9, a-z search seeds) to build a clean symbol list.
+- Pulls extended identifiers (ISIN, BSE/NSE codes, share count, ticker name) from the `scmas-details` endpoint for every stock.
 - Incrementally fetches corporate-action sections per stock, stopping once existing data is reached.
 - Persists structured JSON snapshots under `Historic Data/` for reuse.
-- Optional MongoDB integration with chunked upserts and automatic `id` indexing.
+- Optional MongoDB integration with chunked upserts, automatic `id` indexing, and cleaned symbol keys (SC_ prefix removed when stored).
 
 ## Requirements
 - Python 3.9+
@@ -32,8 +33,9 @@ python moneycontrol_dividends.py [flags]
 | Flag | Type / Values | Description |
 | --- | --- | --- |
 | `--refresh-metadata` | flag | Force a fresh scrape of stock metadata even if a cached JSON exists. |
+| `--refresh-details` | flag | Force refresh of extended symbol identifiers (ISIN/BSE/NSE/ticker/share count) even if cached locally. |
 | `--only` | comma-separated list | Restrict the run to specific stock ids (e.g. `SBIN,TCS`) and/or section codes (`an,bm,d,s,r,ae`). Section codes are case-insensitive. |
-| `--push-only` | flag | Skip scraping and only load the existing JSON payload for MongoDB insertion. Useful after a previous scrape. |
+| `--push-only` | flag | Skip scraping and only load the existing JSON payload for MongoDB insertion (combine with `--refresh-details` to update identifiers before pushing). |
 | `--json-path` | file path | Override the default JSON location (`Historic Data/moneycontrol_corporate_actions.json`). Accepts relative or absolute paths. |
 | `--push-to-mongo` | flag | Enable MongoDB upserts. When set, the script writes the selected dataset to the target collection. |
 | `--mongo-uri` | string (default `mongodb://localhost:27017`) | MongoDB connection string. |
@@ -45,10 +47,10 @@ python moneycontrol_dividends.py [flags]
 
 #### Full scrape + Mongo push
 ```bash
-python moneycontrol_dividends.py --refresh-metadata --push-to-mongo
+python moneycontrol_dividends.py --refresh-metadata --refresh-details --push-to-mongo
 ```
 
-#### Incremental daily refresh
+#### Incremental daily refresh (JSON only)
 ```bash
 python moneycontrol_dividends.py
 ```
@@ -56,12 +58,12 @@ python moneycontrol_dividends.py
 
 #### Refresh a subset and push to Mongo
 ```bash
-python moneycontrol_dividends.py --only SBIN,TCS --push-to-mongo --chunk-size 25
+python moneycontrol_dividends.py --only SBIN,TCS --refresh-details --push-to-mongo --chunk-size 25
 ```
 
-#### Push existing JSON only
+#### Push existing JSON only (with detail refresh)
 ```bash
-python moneycontrol_dividends.py --push-only --push-to-mongo
+python moneycontrol_dividends.py --push-only --refresh-details --push-to-mongo
 ```
 
 ## Output Files
@@ -72,7 +74,7 @@ These files are overwritten on each scrape unless `--push-only` is used.
 
 ## MongoDB Notes
 - Requires a running MongoDB instance (defaults to `mongodb://localhost:27017`).
-- Each stock document is upserted by its `id` field.
+- Each stock document is upserted by its `id` field; identifier keys are stored without the `SC_` prefix in Mongo.
 - Index `id_1` is created automatically if missing.
 
 ## Troubleshooting

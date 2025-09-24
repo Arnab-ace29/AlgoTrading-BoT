@@ -1,85 +1,74 @@
-# Moneycontrol Corporate Actions Scraper
+﻿# Moneycontrol Corporate Actions Scraper
 
-This project scrapes corporate-action data (announcements, board meetings, dividends, splits, rights issues, and AGM/EGM notices) from the Moneycontrol public API, stores the results as JSON for backup, and keeps an up-to-date copy in MongoDB.
+This scraper pulls comprehensive corporate data for every stock listed on Moneycontrol and keeps it synchronised across JSON backups and a MongoDB datastore. The pipeline covers symbol discovery, detailed identifiers, corporate-action history, and Mongo-friendly data normalisation.
 
-## Features
-- Crawls Moneycontrol's stock directory (0-9, a-z search seeds) to build a clean symbol list.
-- Pulls extended identifiers (ISIN, BSE/NSE codes, share count, ticker name) from the `scmas-details` endpoint for every stock.
-- Incrementally fetches corporate-action sections per stock, stopping once existing data is reached.
-- Normalises section payloads so there are no duplicate aliases (e.g. only `d["dividend"]`).
-- Persists structured JSON snapshots in `Historic Data/` as a portable backup while MongoDB holds the canonical dataset.
-- Optional MongoDB integration with chunked upserts, automatic `id` indexing, and cleaned symbol keys (SC_ prefix removed when stored).
+## What's Collected
+- **Stock Directory**: All instruments discoverable through Moneycontrol's search API using `0-9` and `a-z` seeds.
+- **Identifiers**: ISIN, BSE/NSE tickers, share count, and Moneycontrol ticker name from the `scmas-details` endpoint.
+- **Corporate Actions**: Announcements, board meetings, dividends, splits, rights, and AGM/EGM events, with pagination handled automatically to fetch historical entries.
 
-## Requirements
-- Python 3.9+
-- `requests`
-- `pymongo` (only when pushing to MongoDB or using Mongo as the cache source)
+## Data Flow
+1. Load existing data from MongoDB if available; otherwise fall back to JSON backups in `Historic Data/`.
+2. Refresh symbol metadata (`--refresh-metadata`) or identifier details (`--refresh-details`) when required.
+3. Incrementally fetch corporate-action sections, stopping once processed items overlap the cached data.
+4. Normalise section payloads so each stores a single list (e.g. `d["dividend"]` only) to avoid duplication.
+5. Persist outputs to JSON (as a portable backup) and/or MongoDB (canonical store).
 
-Install dependencies:
+## CLI Reference
+Run `python moneycontrol_dividends.py [flags]` from the `scraper/` directory. All flags are optional.
 
-```bash
-pip install -r requirements.txt  # or
-pip install requests pymongo
-```
-
-## Usage
-
-The entry point is `moneycontrol_dividends.py`.
-
-```bash
-python moneycontrol_dividends.py [flags]
-```
-
-### CLI Flags
-| Flag | Type / Values | Description |
+| Flag | Type | Description |
 | --- | --- | --- |
-| `--refresh-metadata` | flag | Force a fresh scrape of stock metadata even if cached locally/Mongo. |
-| `--refresh-details` | flag | Force refresh of extended symbol identifiers (ISIN/BSE/NSE/ticker/share count) even if cached. |
-| `--only` | comma-separated list | Restrict the run to specific stock ids (e.g. `SBIN,TCS`) and/or section codes (`an,bm,d,s,r,ae`). Section codes are case-insensitive. |
-| `--push-only` | flag | Skip scraping and operate on the cached Mongo/JSON payload (combine with `--refresh-details` to refresh identifiers before pushing). |
-| `--json-path` | file path | Override the default JSON backup location (`Historic Data/moneycontrol_corporate_actions.json`). |
-| `--push-to-mongo` | flag | Enable MongoDB upserts. When set, the script writes the selected dataset to the target collections. |
-| `--mongo-uri` | string (default `mongodb://localhost:27017`) | MongoDB connection string. |
-| `--mongo-db` | string (default `moneycontrol`) | Target database for Mongo writes and reads. |
-| `--mongo-collection` | string (default `corporate_actions`) | Mongo collection that stores corporate-action documents. |
-| `--mongo-metadata-collection` | string (default `stock_metadata`) | Mongo collection that stores stock metadata/identifier documents. |
-| `--chunk-size` | integer (default `50`) | Maximum number of stock documents per Mongo bulk write. Keep between 25 and 50 to limit data loss on crash. |
+| `--refresh-metadata` | flag | Force a fresh scrape of stock metadata even if cached locally or in MongoDB. |
+| `--refresh-details` | flag | Force refresh of extended identifiers (ISIN/BSE/NSE, share count, ticker name). |
+| `--only` | comma-separated list | Restrict the run to specific stock IDs (e.g. `SBIN,TCS`) and/or section codes (`an,bm,d,s,r,ae`). |
+| `--push-only` | flag | Skip scraping and operate on existing Mongo/JSON data (combine with `--refresh-details` to update identifiers before pushing). |
+| `--json-path` | path | Override the default JSON backup (`Historic Data/moneycontrol_corporate_actions.json`). |
+| `--push-to-mongo` | flag | Upsert the resulting dataset into MongoDB (both corporate actions and metadata). |
+| `--mongo-uri` | string | MongoDB connection string (default `mongodb://localhost:27017`). |
+| `--mongo-db` | string | Mongo database name (default `moneycontrol`). |
+| `--mongo-collection` | string | Corporate-action collection name (default `corporate_actions`). |
+| `--mongo-metadata-collection` | string | Metadata collection name (default `stock_metadata`). |
+| `--chunk-size` | int | Batch size for Mongo bulk writes (default `50`; keep between 25–50). |
 
-### Common Workflows
+## Common Workflows
 
-#### Full scrape + Mongo push
+### Full Refresh + Mongo Push
 ```bash
 python moneycontrol_dividends.py --refresh-metadata --refresh-details --push-to-mongo
 ```
+Uploads all corporate actions and metadata to MongoDB while updating the JSON backups.
 
-#### Incremental daily refresh (reads from Mongo cache when available)
+### Daily Incremental Run
 ```bash
 python moneycontrol_dividends.py
 ```
-*(Skips metadata scrape if cached, stops per-section once existing data is found, and falls back to Mongo if local JSON files are missing.)*
+Uses cached Mongo data when available, fetches only new corporate actions, updates JSON backups.
 
-#### Refresh a subset and push to Mongo
+### Refresh Specific Stocks
 ```bash
-python moneycontrol_dividends.py --only SBIN,TCS --refresh-details --push-to-mongo --chunk-size 25
+python moneycontrol_dividends.py --only SBIN,TCS --refresh-details --push-to-mongo
 ```
+Processes only the requested stocks/sections and pushes updates to Mongo.
 
-#### Push existing Mongo/JSON snapshot only
+### Push Cached Data Only
 ```bash
 python moneycontrol_dividends.py --push-only --refresh-details --push-to-mongo
 ```
+Skips scraping, refreshes identifiers, and pushes the latest cached data to MongoDB.
 
-## Output Files
+## JSON Backups
 - `Historic Data/moneycontrol_stock_metadata.json`
 - `Historic Data/moneycontrol_corporate_actions.json`
 
-These files are written as backups. MongoDB remains the canonical source, so the scraper works even when the JSON files are absent on a fresh machine.
+These remain as portable snapshots; the scraper still works on a clean machine by reading directly from MongoDB.
 
 ## MongoDB Notes
-- Requires a running MongoDB instance (defaults to `mongodb://localhost:27017`).
-- Each document is upserted by its `id` field; identifier keys are stored without the `SC_` prefix in Mongo.
-- Index `id_1` is created automatically if missing on either collection.
+- Two collections are used: `corporate_actions` and `stock_metadata` (configurable via flags).
+- Documents are upserted on `id`, and identifier keys are stored without the `SC_` prefix for easier querying.
+- Indexes on `id` are created automatically if they do not exist.
 
 ## Troubleshooting
-- Moneycontrol occasionally responds with `403` or empty payloads; the script retries automatically.
-- If `pymongo` is missing, Mongo reads/writes are skipped and a message is printed.
-- To reset the cache, drop the Mongo collections or delete the JSON backups before re-running.
+- Moneycontrol occasionally returns HTTP 403 or empty payloads; the scraper retries with back-off.
+- If `pymongo` is missing, Mongo operations are skipped with a warning.
+- To reset the cache, drop the Mongo collections or delete the JSON backups before rerunning the script.

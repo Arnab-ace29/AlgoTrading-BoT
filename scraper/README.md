@@ -57,6 +57,24 @@ python moneycontrol_dividends.py --push-only --refresh-details --push-to-mongo
 ```
 Skips scraping, refreshes identifiers, and pushes the latest cached data to MongoDB.
 
+### Refresh Identifiers Only (no new action fetch)
+```bash
+python moneycontrol_dividends.py --refresh-details --push-only
+```
+Updates symbol identifiers from the `scmas-details` endpoint while reusing cached corporate actions. Handy after corporate disclosure changes without a new action cycle.
+
+### Pull Only Dividends For Selected Symbols
+```bash
+python moneycontrol_dividends.py --only SBIN,TCS,d --push-to-mongo
+```
+Runs the dividend section (`d`) for the listed stocks and writes the result straight to MongoDB?useful for quick event checks on a watchlist.
+
+### Rebuild JSON Backups From Mongo Snapshot
+```bash
+python moneycontrol_dividends.py --push-only --json-path backup/moneycontrol_corporate_actions.json
+```
+Regenerates fresh JSON backups from the current Mongo cache while leaving the database untouched.
+
 ## JSON Backups
 - `Historic Data/moneycontrol_stock_metadata.json`
 - `Historic Data/moneycontrol_corporate_actions.json`

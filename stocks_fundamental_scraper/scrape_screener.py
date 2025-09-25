@@ -8,6 +8,7 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -65,6 +66,13 @@ SECTION_COLLECTION_NAMES = {
     "quarters": "quarters",
     "ratios": "ratios",
 }
+
+SCRAPE_METADATA_COLLECTION = "scrape metadata"
+
+def build_company_key(bse: Optional[str], nse: Optional[str], isin: Optional[str]) -> Tuple[str, str, str]:
+    """Generate a stable key for tracking per-company metadata in Mongo."""
+    return (normalize_code(bse) or "", normalize_code(nse) or "", normalize_code(isin) or "")
+
 
 class RateLimiter:
     """Simple helper to space outbound HTTP requests."""
@@ -588,6 +596,7 @@ class TargetMongo:
         self.client.admin.command("ping")
         self.db = self.client[db_name]
         self.enable_writes = enable_writes
+        self.metadata_collection = self.db[SCRAPE_METADATA_COLLECTION]
 
     def write_section(self, section: str, df: pd.DataFrame) -> None:
         if not self.enable_writes or df.empty:
@@ -603,6 +612,38 @@ class TargetMongo:
             operations.append(ReplaceOne(key, record, upsert=True))
         if operations:
             collection.bulk_write(operations, ordered=False)
+
+    def fetch_last_updates(self) -> Dict[Tuple[str, str, str], datetime]:
+        """Return last-scraped timestamps indexed by company identifiers."""
+        if not self.enable_writes:
+            return {}
+        documents = self.metadata_collection.find({}, {"_id": 0, "BSEID": 1, "NSEID": 1, "ISINID": 1, "updated_at": 1})
+        lookup: Dict[Tuple[str, str, str], datetime] = {}
+        for doc in documents:
+            timestamp = doc.get("updated_at")
+            if isinstance(timestamp, datetime):
+                key = build_company_key(doc.get("BSEID"), doc.get("NSEID"), doc.get("ISINID"))
+                lookup[key] = timestamp
+        return lookup
+
+    def record_company_scrape(self, metadata: Dict[str, object]) -> None:
+        """Persist the scrape timestamp for a company as soon as data lands."""
+        if not self.enable_writes:
+            return
+        key = build_company_key(metadata.get("BSEID"), metadata.get("NSEID"), metadata.get("ISINID"))
+        document = {
+            "BSEID": key[0],
+            "NSEID": key[1],
+            "ISINID": key[2],
+            "Company Name": metadata.get("Company Name", ""),
+            "Resolved Slug": metadata.get("Resolved Slug", ""),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        self.metadata_collection.replace_one({
+            "BSEID": key[0],
+            "NSEID": key[1],
+            "ISINID": key[2],
+        }, document, upsert=True)
 
 
 def read_index_file(path: Path) -> Sequence[object]:
@@ -729,6 +770,30 @@ def resolve_constituents(
     targets.sort(key=lambda item: (item.name or "", item.sc_bse_id or "", item.sc_nse_id or ""))
     return targets
 
+
+
+
+def prioritise_targets(
+    targets: List[CompanyTarget],
+    last_updates: Dict[Tuple[str, str, str], datetime],
+) -> List[CompanyTarget]:
+    """Sort companies so new/no-history entries run first, followed by the oldest updates."""
+    if not targets:
+        return targets
+    fresh: List[Tuple[int, CompanyTarget]] = []
+    stale: List[Tuple[datetime, int, CompanyTarget]] = []
+    for index, target in enumerate(targets):
+        key = build_company_key(target.sc_bse_id, target.sc_nse_id, target.isin_id)
+        timestamp = last_updates.get(key)
+        if timestamp is None:
+            fresh.append((index, target))
+        else:
+            stale.append((timestamp, index, target))
+    fresh.sort(key=lambda item: item[0])
+    stale.sort(key=lambda item: (item[0], item[1]))
+    ordered: List[CompanyTarget] = [target for _, target in fresh]
+    ordered.extend(target for _, _, target in stale)
+    return ordered
 
 def append_section_results(
     section: str,
@@ -884,6 +949,8 @@ def scrape_company(
                 }
                 for section_name, df in tables.items():
                     append_section_results(section_name, df, metadata, results_dir, target_mongo)
+                if target_mongo is not None:
+                    target_mongo.record_company_scrape(metadata)
                 return True
             except HTTPError as exc:
                 last_error = exc
@@ -1108,6 +1175,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:
         print(f"Error while resolving index constituents: {exc}", file=sys.stderr)
         return 1
+
+    last_updates: Dict[Tuple[str, str, str], datetime] = {}
+    if target_mongo is not None:
+        try:
+            last_updates = target_mongo.fetch_last_updates()
+        except Exception as exc:
+            print(f"Warning: Unable to load last update metadata: {exc}", file=sys.stderr)
+            last_updates = {}
+    targets = prioritise_targets(targets, last_updates)
 
     if not targets:
         print(f"No companies resolved for index '{args.index}'.", file=sys.stderr)

@@ -9,6 +9,7 @@ Python utility for collecting fundamentals from [Screener.in](https://www.screen
 - Reads index and corporate metadata from a Moneycontrol source database (defaults to the `moneycontrol` Mongo DB) and pushes section metrics into the Screener database.
 - Built-in request pacing with exponential backoff and optional proxy rotation to stay within Screener rate limits.
 - Optionally export section data to JSON snapshots when `--results-dir` is supplied; otherwise persist directly to Mongo.
+- Prioritises unseen or stale companies by tracking the last scrape time in Mongo and scheduling oldest entries first.
 - Optional MongoDB upserts (defaulting to `mongodb://localhost:27017` database `screener`) with upsert keys based on index, slug, BSEID, NSEID, and ISINID.
 - Cleans numeric strings (removing commas, percents, currency symbols) so values merge cleanly with other data sources.
 - Resilient to reruns: missing sections are skipped, existing documents are updated in place, and failures are logged (optionally to `exceptions.txt` when `--results-dir` is used).
@@ -94,6 +95,7 @@ python scrape_screener.py --index all --limit 10
 4. **Optionally rotate proxies** - drop one proxy per line into `proxies.txt`, then run with `--proxy-file proxies.txt` to spread traffic across endpoints you control.
 5. **Persist results** - drop `--disable-mongo` and the scraper will upsert into `balance sheet`, `cash flow`, `profit loss`, `quarters`, and `ratios` collections in the target DB.
 6. **Rerun without data loss** - re-launching the script adds new periods while keeping historical rows intact, thanks to the upsert keys.
+7. **Let the freshness queue run** - the scraper stores `updated_at` per company and automatically runs unseen or oldest tickers before recently scraped ones.
 
 > Tip: combine `--limit` with `--results-dir ./snapshots` during testing to inspect the JSON output without polluting Mongo.
 
@@ -143,6 +145,7 @@ Upsert keys mirror the JSON identifiers (`Index`, `Resolved Slug`, `BSEID`, `NSE
 ## Operational Notes
 
 - Screener throttles heavy scrape bursts; tune `--min-delay` / `--max-delay` / `--retry-*` (and optionally `--proxy-file`) to stay within the limits.
+- Scrape metadata lives in the `scrape metadata` collection (`updated_at` per BSE/NSE/ISIN) so you can monitor coverage or seed custom schedules.
 - Proxy files expect one `http[s]://user:pass@host:port` entry per line; rotate only through endpoints you control and trust.
 - If you notice pages missing sections, Screener may have no data or may have changed layout. The scraper logs failures and continues.
 - If you use `--results-dir`, delete the snapshot files there to regenerate clean JSON on the next run.

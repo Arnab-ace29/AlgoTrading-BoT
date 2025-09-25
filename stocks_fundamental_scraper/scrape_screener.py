@@ -32,13 +32,15 @@ SECTIONS = [
 ]
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 OUTPUT_DIR = Path(__file__).resolve().parent
-DEFAULT_RESULTS_DIR = None  # local collections disabled; Mongo only
+DEFAULT_RESULTS_DIR = None  # local JSON snapshots disabled unless explicitly requested
 DEFAULT_CORPORATE_ACTIONS_PATH = Path("scraper") / "Historic Data" / "moneycontrol_corporate_actions.json"
 DEFAULT_INDEX_FILE = OUTPUT_DIR / "index_constituents.json"
 DEFAULT_INDEX_COLLECTION = "index_constituents"
 DEFAULT_CORPORATE_COLLECTION = "corporate_actions"
-DEFAULT_MONGO_URI = "mongodb://localhost:27017"
-DEFAULT_MONGO_DB = "screener"
+DEFAULT_SOURCE_MONGO_URI = "mongodb://localhost:27017"
+DEFAULT_SOURCE_MONGO_DB = "moneycontrol"
+DEFAULT_TARGET_MONGO_URI = "mongodb://localhost:27017"
+DEFAULT_TARGET_MONGO_DB = "screener"
 KEY_COLUMNS = [
     "Index",
     "Company Name",
@@ -206,11 +208,11 @@ def collect_section_tables(
 
 def load_corporate_actions(
     path: Optional[Path],
-    mongo_manager: Optional["MongoManager"],
+    source_mongo: Optional["SourceMongo"],
     corporate_collection: Optional[str],
 ) -> List[dict]:
-    if mongo_manager is not None:
-        actions = mongo_manager.fetch_corporate_actions(corporate_collection)
+    if source_mongo is not None:
+        actions = source_mongo.fetch_corporate_actions(corporate_collection)
         if actions:
             return actions
     if path is not None and path.exists():
@@ -253,8 +255,8 @@ class CompanyTarget:
     isin_id: Optional[str]
     corporate_entry: dict
 
-class MongoManager:
-    """Handles MongoDB interactions for reading indices, corporate actions, and writing sections."""
+class SourceMongo:
+    """Handles reads from the Moneycontrol (source) Mongo database."""
 
     def __init__(
         self,
@@ -262,19 +264,15 @@ class MongoManager:
         db_name: str,
         index_collection: str,
         corporate_collection: str,
-        enable_writes: bool = True,
         timeout_ms: int = 10000,
     ) -> None:
-        if MongoClient is None or ReplaceOne is None:
-            raise RuntimeError(
-                "pymongo is required for MongoDB support. Install it via 'pip install pymongo'."
-            )
+        if MongoClient is None:
+            raise RuntimeError("pymongo is required for MongoDB support. Install it via 'pip install pymongo'.")
         self.client = MongoClient(uri, serverSelectionTimeoutMS=timeout_ms)
         self.client.admin.command("ping")
         self.db = self.client[db_name]
         self.index_collection = index_collection
         self.corporate_collection = corporate_collection
-        self.enable_writes = enable_writes
 
     def fetch_index(self, index_name: str, collection_name: Optional[str] = None) -> Optional[Sequence[object]]:
         collection = self.db[collection_name or self.index_collection]
@@ -300,6 +298,24 @@ class MongoManager:
         collection = self.db[collection_name or self.corporate_collection]
         documents = list(collection.find({}, {"_id": 0}))
         return documents
+
+
+class TargetMongo:
+    """Handles writes to the Screener (target) Mongo database."""
+
+    def __init__(
+        self,
+        uri: str,
+        db_name: str,
+        enable_writes: bool = True,
+        timeout_ms: int = 10000,
+    ) -> None:
+        if MongoClient is None or ReplaceOne is None:
+            raise RuntimeError("pymongo is required for MongoDB support. Install it via 'pip install pymongo'.")
+        self.client = MongoClient(uri, serverSelectionTimeoutMS=timeout_ms)
+        self.client.admin.command("ping")
+        self.db = self.client[db_name]
+        self.enable_writes = enable_writes
 
     def write_section(self, section: str, df: pd.DataFrame) -> None:
         if not self.enable_writes or df.empty:
@@ -333,22 +349,23 @@ def read_index_file(path: Path) -> Sequence[object]:
         descriptors.append(stripped)
     return descriptors
 
+
 def load_index_descriptors(
     index_name: str,
     index_file: Optional[Path],
-    mongo_manager: Optional["MongoManager"],
+    source_mongo: Optional["SourceMongo"],
 ) -> Sequence[object]:
     if index_file and index_file.exists():
         return read_index_file(index_file)
 
-    if mongo_manager is not None:
-        descriptors = mongo_manager.fetch_index(index_name)
+    if source_mongo is not None:
+        descriptors = source_mongo.fetch_index(index_name)
         if descriptors is not None:
             return descriptors
         if index_file and index_file.exists():
             return read_index_file(index_file)
         raise KeyError(
-            f"Index '{index_name}' not found in Mongo collection '{mongo_manager.index_collection}'."
+            f"Index '{index_name}' not found in Mongo collection '{source_mongo.index_collection}'."
         )
 
     path_candidate = Path(index_name)
@@ -359,6 +376,7 @@ def load_index_descriptors(
         f"Unable to resolve index '{index_name}'. Provide a valid --index-file backup or ensure Mongo contains the mapping."
     )
 
+
 def normalize_code(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -367,11 +385,12 @@ def normalize_code(value: Optional[str]) -> Optional[str]:
         return None
     return value
 
+
 def resolve_constituents(
     index_name: str,
     corporate_actions: List[dict],
     index_file: Optional[Path],
-    mongo_manager: Optional["MongoManager"],
+    source_mongo: Optional["SourceMongo"],
 ) -> List[CompanyTarget]:
     index_lower = index_name.lower()
     by_bse, by_nse = build_corporate_lookup(corporate_actions)
@@ -398,7 +417,8 @@ def resolve_constituents(
             )
         targets.sort(key=lambda item: (item.name or "", item.sc_bse_id or "", item.sc_nse_id or ""))
         return targets
-    descriptors = load_index_descriptors(index_name, index_file, mongo_manager)
+
+    descriptors = load_index_descriptors(index_name, index_file, source_mongo)
     for descriptor in descriptors:
         bse, nse = parse_constituent_descriptor(descriptor)
         bse = normalize_code(bse)
@@ -428,20 +448,13 @@ def resolve_constituents(
     targets.sort(key=lambda item: (item.name or "", item.sc_bse_id or "", item.sc_nse_id or ""))
     return targets
 
-def extract_slug_from_url(url: str) -> str:
-    parts = [part for part in url.split("/") if part]
-    if "company" in parts:
-        idx = parts.index("company")
-        if len(parts) > idx + 1:
-            return parts[idx + 1]
-    return parts[-1] if parts else url
 
 def append_section_results(
     section: str,
     df: pd.DataFrame,
     metadata: Dict[str, object],
     results_dir: Optional[Path],
-    mongo_manager: Optional["MongoManager"] = None,
+    target_mongo: Optional["TargetMongo"] = None,
 ) -> None:
     enriched_df = df.copy()
     for column, value in metadata.items():
@@ -501,15 +514,14 @@ def append_section_results(
         result_df.sort_values(by=KEY_COLUMNS, inplace=True)
         result_df.to_json(target_path, orient="records", force_ascii=False, indent=2)
 
-    if mongo_manager is not None:
+    if target_mongo is not None:
         try:
-            mongo_manager.write_section(section, new_records_df)
+            target_mongo.write_section(section, new_records_df)
         except Exception as exc:  # pragma: no cover - warn only
             print(
                 f"Warning: Failed to write data for section '{section}' to MongoDB: {exc}",
                 file=sys.stderr,
             )
-
 
 
 def update_exception_file(path: Path, new_exceptions: Iterable[Tuple[str, str]]) -> None:
@@ -537,8 +549,8 @@ def scrape_company(
     target: CompanyTarget,
     index_name: str,
     consolidated: bool,
-    results_dir: Path,
-    mongo_manager: Optional["MongoManager"] = None,
+    results_dir: Optional[Path],
+    target_mongo: Optional["TargetMongo"] = None,
 ) -> bool:
     slug_candidates: List[Tuple[str, str]] = []
     if target.sc_bse_id:
@@ -565,7 +577,7 @@ def scrape_company(
                 "ISINID": target.isin_id or normalize_code(target.corporate_entry.get("SC_ISINID")) or "",
             }
             for section_name, df in tables.items():
-                append_section_results(section_name, df, metadata, results_dir, mongo_manager)
+                append_section_results(section_name, df, metadata, results_dir, target_mongo)
             return True
         except requests.HTTPError as exc:
             last_error = exc
@@ -585,7 +597,7 @@ def scrape_company(
 
 def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scrape Screener tables into CSV files.")
-    parser.add_argument("--index", required=True, help="Index name or file path describing index constituents.")
+    parser.add_argument("--index", required=True, help="Index name or path describing index constituents.")
     parser.add_argument(
         "--index-file",
         default=str(DEFAULT_INDEX_FILE),
@@ -602,24 +614,39 @@ def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="MongoDB collection containing corporate action metadata (default: %(default)s).",
     )
     parser.add_argument(
+        "--source-mongo-uri",
+        default=DEFAULT_SOURCE_MONGO_URI,
+        help="MongoDB connection URI for the Moneycontrol source database (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--source-mongo-db",
+        default=DEFAULT_SOURCE_MONGO_DB,
+        help="Source Mongo database containing index and corporate metadata (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--source-index-collection",
+        default=DEFAULT_INDEX_COLLECTION,
+        help="Source Mongo collection with index constituents (default: %(default)s).",
+    )
+    parser.add_argument(
         "--results-dir",
         default=None,
         help="Optional directory for JSON snapshots; leave unset to rely solely on Mongo.",
     )
     parser.add_argument(
-        "--mongo-uri",
-        default=DEFAULT_MONGO_URI,
-        help="MongoDB connection URI (default: %(default)s).",
+        "--target-mongo-uri",
+        default=DEFAULT_TARGET_MONGO_URI,
+        help="MongoDB connection URI for the Screener target database (default: %(default)s).",
     )
     parser.add_argument(
-        "--mongo-db",
-        default=DEFAULT_MONGO_DB,
-        help="MongoDB database name to target (default: %(default)s).",
+        "--target-mongo-db",
+        default=DEFAULT_TARGET_MONGO_DB,
+        help="Target Mongo database where section collections live (default: %(default)s).",
     )
     parser.add_argument(
         "--disable-mongo",
         action="store_true",
-        help="Skip writing scraped data to MongoDB.",
+        help="Skip writing scraped data to the target MongoDB.",
     )
     parser.add_argument(
         "--limit",
@@ -633,73 +660,73 @@ def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     return parser.parse_args(argv)
 
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = read_args(argv)
     consolidated = not args.standalone
 
     corporate_actions_path: Optional[Path] = None
-    corporate_collection = args.corporate_collection or DEFAULT_CORPORATE_COLLECTION
     if args.corporate_actions:
         candidate = Path(args.corporate_actions)
         if candidate.exists():
             corporate_actions_path = candidate
-        elif args.corporate_actions != str(DEFAULT_CORPORATE_ACTIONS_PATH):
-            corporate_collection = args.corporate_actions
 
-    if not corporate_collection:
-        corporate_collection = DEFAULT_CORPORATE_COLLECTION
-
-    index_file_path: Optional[Path] = None
-    index_collection: Optional[str] = None
-    if args.index_file:
-        candidate = Path(args.index_file)
-        if candidate.exists():
-            index_file_path = candidate
-        elif args.index_file == str(DEFAULT_INDEX_FILE):
-            index_collection = DEFAULT_INDEX_COLLECTION
-        else:
-            index_collection = args.index_file
-    if index_collection is None:
-        index_collection = DEFAULT_INDEX_COLLECTION
-
-    enable_writes = not args.disable_mongo
-    need_mongo_for_index = index_file_path is None
-    need_mongo_for_corporate = corporate_actions_path is None
-    mongo_manager: Optional["MongoManager"] = None
-
-    if need_mongo_for_index or need_mongo_for_corporate or enable_writes:
-        mongo_uri = args.mongo_uri or DEFAULT_MONGO_URI
-        mongo_db = args.mongo_db or DEFAULT_MONGO_DB
-        try:
-            mongo_manager = MongoManager(
-                mongo_uri,
-                mongo_db,
-                index_collection,
-                corporate_collection,
-                enable_writes=enable_writes,
-            )
-        except Exception as exc:
-            if need_mongo_for_index or need_mongo_for_corporate:
-                print(f"Error connecting to MongoDB: {exc}", file=sys.stderr)
-                return 1
-            print(
-                f"Warning: Failed to connect to MongoDB ({exc}). Continuing without database writes.",
-                file=sys.stderr,
-            )
-            mongo_manager = None
-            enable_writes = False
-
-    if mongo_manager is not None and not enable_writes:
-        mongo_manager.enable_writes = False
+    source_uri = args.source_mongo_uri or DEFAULT_SOURCE_MONGO_URI
+    source_db = args.source_mongo_db or DEFAULT_SOURCE_MONGO_DB
+    source_index_collection = args.source_index_collection or DEFAULT_INDEX_COLLECTION
+    source_corporate_collection = args.corporate_collection or DEFAULT_CORPORATE_COLLECTION
 
     try:
-        corporate_actions = load_corporate_actions(corporate_actions_path, mongo_manager, corporate_collection)
+        source_mongo = SourceMongo(
+            source_uri,
+            source_db,
+            source_index_collection,
+            source_corporate_collection,
+        )
+    except Exception as exc:
+        print(f"Error connecting to source MongoDB: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        corporate_actions = load_corporate_actions(
+            corporate_actions_path,
+            source_mongo,
+            source_corporate_collection,
+        )
     except Exception as exc:
         print(f"Error while loading corporate actions: {exc}", file=sys.stderr)
         return 1
 
+    index_file_path: Optional[Path] = None
+    if args.index_file:
+        candidate = Path(args.index_file)
+        if candidate.exists():
+            index_file_path = candidate
+
+    enable_target_writes = not args.disable_mongo
+    target_mongo: Optional[TargetMongo] = None
+    if enable_target_writes:
+        target_uri = args.target_mongo_uri or DEFAULT_TARGET_MONGO_URI
+        target_db = args.target_mongo_db or DEFAULT_TARGET_MONGO_DB
+        try:
+            target_mongo = TargetMongo(
+                target_uri,
+                target_db,
+                enable_writes=True,
+            )
+        except Exception as exc:
+            print(f"Error connecting to target MongoDB: {exc}", file=sys.stderr)
+            return 1
+    else:
+        target_mongo = None
+
     try:
-        targets = resolve_constituents(args.index, corporate_actions, index_file_path, mongo_manager)
+        targets = resolve_constituents(
+            args.index,
+            corporate_actions,
+            index_file_path,
+            source_mongo,
+        )
     except Exception as exc:
         print(f"Error while resolving index constituents: {exc}", file=sys.stderr)
         return 1
@@ -720,7 +747,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     processed = 0
     with requests.Session() as session:
         for target in tqdm(targets, desc=f"Scraping {args.index}", unit="company"):
-            success = scrape_company(session, target, args.index, consolidated, results_dir, mongo_manager)
+            success = scrape_company(
+                session,
+                target,
+                args.index,
+                consolidated,
+                results_dir,
+                target_mongo,
+            )
             if success:
                 processed += 1
             else:
@@ -732,7 +766,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             update_exception_file(exception_path, exceptions)
             print(f"Recorded {len(exceptions)} failures to {exception_path}")
         else:
-            print(f"Recorded {len(exceptions)} failures (exceptions file disabled because --results-dir was not provided).")
+            print(
+                f"Recorded {len(exceptions)} failures (exceptions file disabled because --results-dir was not provided)."
+            )
 
     print(f"Scraped {processed} companies for index '{args.index}'.")
     return 0

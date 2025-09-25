@@ -6,10 +6,11 @@ Python utility for collecting fundamentals from [Screener.in](https://www.screen
 
 - Scrape multiple Screener sections (`quarters`, `profit-loss`, `balance-sheet`, `cash-flow`, `ratios`) for every company in a supplied index list.
 - Expand child KPI schedules under each parent row and track parent/child relationships explicitly.
+- Reads index and corporate metadata from a Moneycontrol source database (defaults to the `moneycontrol` Mongo DB) and pushes section metrics into the Screener database.
 - Optionally export section data to JSON snapshots when `--results-dir` is supplied; otherwise persist directly to Mongo.
 - Optional MongoDB upserts (defaulting to `mongodb://localhost:27017` database `screener`) with upsert keys based on index, slug, BSEID, NSEID, and ISINID.
 - Cleans numeric strings (removing commas, percents, currency symbols) so values merge cleanly with other data sources.
-- Resilient to reruns: missing sections are skipped, existing documents are updated in place, and failed lookups are captured in `collections/exceptions.txt`.
+- Resilient to reruns: missing sections are skipped, existing documents are updated in place, and failures are logged (optionally to `exceptions.txt` when `--results-dir` is used).
 
 ## Requirements
 
@@ -68,11 +69,14 @@ python scrape_screener.py --index all --limit 10
 | `--index-file` | Optional backup JSON map; Mongo is queried first using the configured collection. |
 | `--corporate-actions` | Optional backup JSON file; Mongo supplies corporate metadata when this file is absent. |
 | `--corporate-collection` | MongoDB collection containing corporate metadata (default `corporate_actions`). |
+| `--source-mongo-uri` | Mongo URI for the Moneycontrol source database (default `mongodb://localhost:27017`). |
+| `--source-mongo-db` | Source database name holding index/corporate datasets (default `moneycontrol`). |
+| `--source-index-collection` | Source collection with index constituents (default `index_constituents`). |
 | `--results-dir` | Optional directory for JSON snapshots; leave unset to skip local files. |
 | `--limit` | Restrict the number of companies (useful for smoke-tests). |
 | `--standalone` | Fetch standalone rather than consolidated numbers. |
-| `--mongo-uri` | MongoDB URI (defaults to `mongodb://localhost:27017`). |
-| `--mongo-db` | MongoDB database name (defaults to `screener`). |
+| `--target-mongo-uri` | Mongo URI for the Screener target database (default `mongodb://localhost:27017`). |
+| `--target-mongo-db` | Target Mongo database name (default `screener`). |
 | `--disable-mongo` | Skip Mongo writes even if URI/DB are set.
 
 ### Examples
@@ -104,7 +108,7 @@ python scrape_screener.py --index BANKNIFTY --standalone
   - `Index`, `Company Name`, `Company ID`
   - `Row Type` (`Parent`, `Child`, `Standalone`)
   - `Parent KPI`, `Child KPI`, and the metric columns (`Mar 2025`, etc.).
-- `collections/exceptions.txt` ? pairs of BSEID,NSEID that failed to resolve or scrape.
+- If `--results-dir` is set, an `exceptions.txt` snapshot is created alongside the JSON files with pairs of BSEID,NSEID that failed to resolve or scrape.
 
 When Mongo is enabled, the same rows are upserted into Mongo collections named:
 

@@ -37,6 +37,7 @@ DEFAULT_CORPORATE_ACTIONS_PATH = Path("scraper") / "Historic Data" / "moneycontr
 DEFAULT_INDEX_FILE = OUTPUT_DIR / "index_constituents.json"
 DEFAULT_INDEX_COLLECTION = "index_constituents"
 DEFAULT_CORPORATE_COLLECTION = "corporate_actions"
+DEFAULT_SOURCE_COLLECTION = "corporate_actions"
 DEFAULT_SOURCE_MONGO_URI = "mongodb://localhost:27017"
 DEFAULT_SOURCE_MONGO_DB = "moneycontrol"
 DEFAULT_TARGET_MONGO_URI = "mongodb://localhost:27017"
@@ -62,6 +63,46 @@ SECTION_COLLECTION_NAMES = {
     "quarters": "quarters",
     "ratios": "ratios",
 }
+
+def extract_identifiers(entry: Dict[str, object]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if not isinstance(entry, dict):
+        return None, None, None
+    bse_candidates = (
+        entry.get("SC_BSEID"),
+        entry.get("SC_BSE"),
+        entry.get("BSEID"),
+        entry.get("BSE"),
+        entry.get("bseId"),
+        entry.get("bse"),
+        entry.get("BSE Code"),
+        entry.get("scripBSE"),
+    )
+    nse_candidates = (
+        entry.get("SC_NSEID"),
+        entry.get("SC_NSE"),
+        entry.get("NSEID"),
+        entry.get("NSE"),
+        entry.get("nseId"),
+        entry.get("nse"),
+        entry.get("NSE Code"),
+        entry.get("scripNSE"),
+    )
+    isin_candidates = (
+        entry.get("SC_ISINID"),
+        entry.get("ISIN"),
+        entry.get("isin"),
+    )
+    def first_non_empty(values):
+        for value in values:
+            if value not in (None, ""):
+                return value
+        return None
+    return (
+        first_non_empty(bse_candidates),
+        first_non_empty(nse_candidates),
+        first_non_empty(isin_candidates),
+    )
+
 
 def normalize_label(raw: object) -> str:
     """Return a cleaned, ASCII-friendly representation of a KPI label."""
@@ -262,8 +303,7 @@ class SourceMongo:
         self,
         uri: str,
         db_name: str,
-        index_collection: str,
-        corporate_collection: str,
+        collection: str,
         timeout_ms: int = 10000,
     ) -> None:
         if MongoClient is None:
@@ -271,11 +311,12 @@ class SourceMongo:
         self.client = MongoClient(uri, serverSelectionTimeoutMS=timeout_ms)
         self.client.admin.command("ping")
         self.db = self.client[db_name]
-        self.index_collection = index_collection
-        self.corporate_collection = corporate_collection
+        self.collection = collection
+        self.index_collection = collection
+        self.corporate_collection = collection
 
     def fetch_index(self, index_name: str, collection_name: Optional[str] = None) -> Optional[Sequence[object]]:
-        collection = self.db[collection_name or self.index_collection]
+        collection = self.db[collection_name or self.collection]
         doc = (
             collection.find_one({"name": index_name})
             or collection.find_one({"index": index_name})
@@ -295,9 +336,25 @@ class SourceMongo:
         return None
 
     def fetch_corporate_actions(self, collection_name: Optional[str] = None) -> List[dict]:
-        collection = self.db[collection_name or self.corporate_collection]
+        collection = self.db[collection_name or self.collection]
         documents = list(collection.find({}, {"_id": 0}))
         return documents
+
+    def fetch_all_companies(self, collection_name: Optional[str] = None) -> List[dict]:
+        collection = self.db[collection_name or self.collection]
+        documents = list(collection.find({}, {"_id": 0}))
+        records: List[dict] = []
+        for doc in documents:
+            if isinstance(doc, dict):
+                if any(doc.get(key) for key in ("SC_BSEID", "SC_NSEID", "SC_ISINID")):
+                    records.append(doc)
+                for key in ("constituents", "members", "companies", "items", "entries", "data"):
+                    payload = doc.get(key)
+                    if isinstance(payload, list):
+                        for item in payload:
+                            if isinstance(item, dict):
+                                records.append(item)
+        return records
 
 
 class TargetMongo:
@@ -397,7 +454,10 @@ def resolve_constituents(
     targets: List[CompanyTarget] = []
     seen_pairs = set()
     if index_lower == "all":
-        for entry in corporate_actions:
+        source_records: List[dict] = corporate_actions or []
+        if source_mongo is not None:
+            source_records = source_records or source_mongo.fetch_all_companies()
+        for entry in source_records:
             bse = normalize_code(entry.get("SC_BSEID"))
             nse = normalize_code(entry.get("SC_NSEID"))
             pair = (bse or "", nse or "")
@@ -408,7 +468,7 @@ def resolve_constituents(
             seen_pairs.add(pair)
             targets.append(
                 CompanyTarget(
-                    name=entry.get("name", entry.get("shortName", "")),
+                    name=entry.get("name", entry.get("shortName", entry.get("Name", ""))),
                     sc_bse_id=bse,
                     sc_nse_id=nse,
                     isin_id=normalize_code(entry.get("SC_ISINID")),
@@ -624,11 +684,6 @@ def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Source Mongo database containing index and corporate metadata (default: %(default)s).",
     )
     parser.add_argument(
-        "--source-index-collection",
-        default=DEFAULT_INDEX_COLLECTION,
-        help="Source Mongo collection with index constituents (default: %(default)s).",
-    )
-    parser.add_argument(
         "--results-dir",
         default=None,
         help="Optional directory for JSON snapshots; leave unset to rely solely on Mongo.",
@@ -673,15 +728,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     source_uri = args.source_mongo_uri or DEFAULT_SOURCE_MONGO_URI
     source_db = args.source_mongo_db or DEFAULT_SOURCE_MONGO_DB
-    source_index_collection = args.source_index_collection or DEFAULT_INDEX_COLLECTION
-    source_corporate_collection = args.corporate_collection or DEFAULT_CORPORATE_COLLECTION
+    source_collection = args.corporate_collection or DEFAULT_SOURCE_COLLECTION
 
     try:
         source_mongo = SourceMongo(
             source_uri,
             source_db,
-            source_index_collection,
-            source_corporate_collection,
+            source_collection,
         )
     except Exception as exc:
         print(f"Error connecting to source MongoDB: {exc}", file=sys.stderr)
@@ -691,7 +744,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         corporate_actions = load_corporate_actions(
             corporate_actions_path,
             source_mongo,
-            source_corporate_collection,
+            source_collection,
         )
     except Exception as exc:
         print(f"Error while loading corporate actions: {exc}", file=sys.stderr)

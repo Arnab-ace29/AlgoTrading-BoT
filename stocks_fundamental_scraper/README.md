@@ -68,10 +68,9 @@ python scrape_screener.py --index all --limit 10
 | `--index` | Index name or path to the constituent list (required). |
 | `--index-file` | Optional backup JSON map; Mongo is queried first using the configured collection. |
 | `--corporate-actions` | Optional backup JSON file; Mongo supplies corporate metadata when this file is absent. |
-| `--corporate-collection` | MongoDB collection containing corporate metadata (default `corporate_actions`). |
+| `--corporate-collection` | MongoDB collection containing source corporate metadata (default `corporate_actions`). |
 | `--source-mongo-uri` | Mongo URI for the Moneycontrol source database (default `mongodb://localhost:27017`). |
 | `--source-mongo-db` | Source database name holding index/corporate datasets (default `moneycontrol`). |
-| `--source-index-collection` | Source collection with index constituents (default `index_constituents`). |
 | `--results-dir` | Optional directory for JSON snapshots; leave unset to skip local files. |
 | `--limit` | Restrict the number of companies (useful for smoke-tests). |
 | `--standalone` | Fetch standalone rather than consolidated numbers. |

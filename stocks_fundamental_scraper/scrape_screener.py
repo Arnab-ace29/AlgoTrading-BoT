@@ -36,6 +36,7 @@ DEFAULT_RESULTS_DIR = OUTPUT_DIR / "collections"
 DEFAULT_CORPORATE_ACTIONS_PATH = Path("scraper") / "Historic Data" / "moneycontrol_corporate_actions.json"
 DEFAULT_INDEX_FILE = OUTPUT_DIR / "index_constituents.json"
 DEFAULT_INDEX_COLLECTION = "index_constituents"
+DEFAULT_CORPORATE_COLLECTION = "corporate_actions"
 DEFAULT_MONGO_URI = "mongodb://localhost:27017"
 DEFAULT_MONGO_DB = "screener"
 KEY_COLUMNS = [
@@ -203,9 +204,21 @@ def collect_section_tables(
             output[section] = df
     return output
 
-def load_corporate_actions(path: Path) -> List[dict]:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+def load_corporate_actions(
+    path: Optional[Path],
+    mongo_manager: Optional["MongoManager"],
+    corporate_collection: Optional[str],
+) -> List[dict]:
+    if mongo_manager is not None:
+        actions = mongo_manager.fetch_corporate_actions(corporate_collection)
+        if actions:
+            return actions
+    if path is not None and path.exists():
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    raise FileNotFoundError(
+        "Corporate actions data not found in Mongo or at the provided path."
+    )
 
 def build_corporate_lookup(corporate_actions: Iterable[dict]) -> Tuple[Dict[str, dict], Dict[str, dict]]:
     by_bse: Dict[str, dict] = {}
@@ -241,13 +254,14 @@ class CompanyTarget:
     corporate_entry: dict
 
 class MongoManager:
-    """Handles MongoDB interactions for reading indices and writing sections."""
+    """Handles MongoDB interactions for reading indices, corporate actions, and writing sections."""
 
     def __init__(
         self,
         uri: str,
         db_name: str,
         index_collection: str,
+        corporate_collection: str,
         enable_writes: bool = True,
         timeout_ms: int = 10000,
     ) -> None:
@@ -256,9 +270,10 @@ class MongoManager:
                 "pymongo is required for MongoDB support. Install it via 'pip install pymongo'."
             )
         self.client = MongoClient(uri, serverSelectionTimeoutMS=timeout_ms)
-        self.client.admin.command("ping")  # fail fast if credentials are invalid
+        self.client.admin.command("ping")
         self.db = self.client[db_name]
         self.index_collection = index_collection
+        self.corporate_collection = corporate_collection
         self.enable_writes = enable_writes
 
     def fetch_index(self, index_name: str, collection_name: Optional[str] = None) -> Optional[Sequence[object]]:
@@ -276,11 +291,15 @@ class MongoManager:
             payload = doc.get(key)
             if isinstance(payload, list):
                 return payload
-        # Fallback: if the document stores the list under the index name key
         payload = doc.get(index_name)
         if isinstance(payload, list):
             return payload
         return None
+
+    def fetch_corporate_actions(self, collection_name: Optional[str] = None) -> List[dict]:
+        collection = self.db[collection_name or self.corporate_collection]
+        documents = list(collection.find({}, {"_id": 0}))
+        return documents
 
     def write_section(self, section: str, df: pd.DataFrame) -> None:
         if not self.enable_writes or df.empty:
@@ -296,6 +315,7 @@ class MongoManager:
             operations.append(ReplaceOne(key, record, upsert=True))
         if operations:
             collection.bulk_write(operations, ordered=False)
+
 
 def read_index_file(path: Path) -> Sequence[object]:
     if path.suffix.lower() == ".json":
@@ -572,7 +592,12 @@ def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--corporate-actions",
         default=str(DEFAULT_CORPORATE_ACTIONS_PATH),
-        help="Path to Moneycontrol corporate actions dataset (default: %(default)s)",
+        help="Optional backup JSON file for corporate actions; Mongo is used when this file is absent.",
+    )
+    parser.add_argument(
+        "--corporate-collection",
+        default=DEFAULT_CORPORATE_COLLECTION,
+        help="MongoDB collection containing corporate action metadata (default: %(default)s).",
     )
     parser.add_argument(
         "--results-dir",
@@ -610,11 +635,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = read_args(argv)
     consolidated = not args.standalone
 
-    corporate_actions_path = Path(args.corporate_actions)
-    if not corporate_actions_path.exists():
-        print(f"Corporate actions file not found: {corporate_actions_path}", file=sys.stderr)
-        return 1
-    corporate_actions = load_corporate_actions(corporate_actions_path)
+    corporate_actions_path: Optional[Path] = None
+    corporate_collection = args.corporate_collection or DEFAULT_CORPORATE_COLLECTION
+    if args.corporate_actions:
+        candidate = Path(args.corporate_actions)
+        if candidate.exists():
+            corporate_actions_path = candidate
+        elif args.corporate_actions != str(DEFAULT_CORPORATE_ACTIONS_PATH):
+            corporate_collection = args.corporate_actions
+
+    if not corporate_collection:
+        corporate_collection = DEFAULT_CORPORATE_COLLECTION
 
     index_file_path: Optional[Path] = None
     index_collection: Optional[str] = None
@@ -631,9 +662,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     enable_writes = not args.disable_mongo
     need_mongo_for_index = index_file_path is None
+    need_mongo_for_corporate = corporate_actions_path is None
     mongo_manager: Optional["MongoManager"] = None
 
-    if need_mongo_for_index or enable_writes:
+    if need_mongo_for_index or need_mongo_for_corporate or enable_writes:
         mongo_uri = args.mongo_uri or DEFAULT_MONGO_URI
         mongo_db = args.mongo_db or DEFAULT_MONGO_DB
         try:
@@ -641,10 +673,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 mongo_uri,
                 mongo_db,
                 index_collection,
+                corporate_collection,
                 enable_writes=enable_writes,
             )
         except Exception as exc:
-            if need_mongo_for_index:
+            if need_mongo_for_index or need_mongo_for_corporate:
                 print(f"Error connecting to MongoDB: {exc}", file=sys.stderr)
                 return 1
             print(
@@ -653,6 +686,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             mongo_manager = None
             enable_writes = False
+
+    if mongo_manager is not None and not enable_writes:
+        mongo_manager.enable_writes = False
+
+    try:
+        corporate_actions = load_corporate_actions(corporate_actions_path, mongo_manager, corporate_collection)
+    except Exception as exc:
+        print(f"Error while loading corporate actions: {exc}", file=sys.stderr)
+        return 1
 
     try:
         targets = resolve_constituents(args.index, corporate_actions, index_file_path, mongo_manager)

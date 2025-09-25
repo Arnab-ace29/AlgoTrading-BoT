@@ -36,7 +36,7 @@ python -m pip install requests pandas beautifulsoup4 tqdm pymongo
 
 ## Input Data
 
-The scraper expects a Moneycontrol corporate actions dump for resolving BSE/NSE/ISIN identifiers:
+Corporate metadata is expected in MongoDB (default collection `corporate_actions`). You can keep a Moneycontrol dump (`moneycontrol_corporate_actions.json`) as a fallback backup:
 
 ```
 scraper/
@@ -66,7 +66,8 @@ python scrape_screener.py --index all --limit 10
 |------|-------------|
 | `--index` | Index name or path to the constituent list (required). |
 | `--index-file` | Optional backup JSON map; Mongo is queried first using the configured collection. |
-| `--corporate-actions` | Path to the Moneycontrol corporate actions JSON (default `../scraper/Historic Data/moneycontrol_corporate_actions.json`). |
+| `--corporate-actions` | Optional backup JSON file; Mongo supplies corporate metadata when this file is absent. |
+| `--corporate-collection` | MongoDB collection containing corporate metadata (default `corporate_actions`). |
 | `--results-dir` | Directory for JSON collections (`collections` by default). |
 | `--limit` | Restrict the number of companies (useful for smoke-tests). |
 | `--standalone` | Fetch standalone rather than consolidated numbers. |

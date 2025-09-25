@@ -35,6 +35,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent
 DEFAULT_RESULTS_DIR = OUTPUT_DIR / "collections"
 DEFAULT_CORPORATE_ACTIONS_PATH = Path("scraper") / "Historic Data" / "moneycontrol_corporate_actions.json"
 DEFAULT_INDEX_FILE = OUTPUT_DIR / "index_constituents.json"
+DEFAULT_INDEX_COLLECTION = "index_constituents"
 DEFAULT_MONGO_URI = "mongodb://localhost:27017"
 DEFAULT_MONGO_DB = "screener"
 KEY_COLUMNS = [
@@ -239,21 +240,50 @@ class CompanyTarget:
     isin_id: Optional[str]
     corporate_entry: dict
 
-class MongoWriter:
-    """Simple helper for streaming section rows into MongoDB collections."""
+class MongoManager:
+    """Handles MongoDB interactions for reading indices and writing sections."""
 
-    def __init__(self, uri: str, db_name: str, timeout_ms: int = 10000) -> None:
+    def __init__(
+        self,
+        uri: str,
+        db_name: str,
+        index_collection: str,
+        enable_writes: bool = True,
+        timeout_ms: int = 10000,
+    ) -> None:
         if MongoClient is None or ReplaceOne is None:
             raise RuntimeError(
                 "pymongo is required for MongoDB support. Install it via 'pip install pymongo'."
             )
         self.client = MongoClient(uri, serverSelectionTimeoutMS=timeout_ms)
-        # Validate connection eagerly so the job fails fast if credentials are invalid.
-        self.client.admin.command("ping")
+        self.client.admin.command("ping")  # fail fast if credentials are invalid
         self.db = self.client[db_name]
+        self.index_collection = index_collection
+        self.enable_writes = enable_writes
 
-    def write(self, section: str, df: pd.DataFrame) -> None:
-        if df.empty:
+    def fetch_index(self, index_name: str, collection_name: Optional[str] = None) -> Optional[Sequence[object]]:
+        collection = self.db[collection_name or self.index_collection]
+        doc = (
+            collection.find_one({"name": index_name})
+            or collection.find_one({"index": index_name})
+            or collection.find_one({"_id": index_name})
+        )
+        if not doc:
+            return None
+        if isinstance(doc, list):
+            return doc
+        for key in ("constituents", "members", "companies", "items", "entries", "data"):
+            payload = doc.get(key)
+            if isinstance(payload, list):
+                return payload
+        # Fallback: if the document stores the list under the index name key
+        payload = doc.get(index_name)
+        if isinstance(payload, list):
+            return payload
+        return None
+
+    def write_section(self, section: str, df: pd.DataFrame) -> None:
+        if not self.enable_writes or df.empty:
             return
         collection_name = SECTION_COLLECTION_NAMES.get(section, section)
         collection = self.db[collection_name]
@@ -283,21 +313,30 @@ def read_index_file(path: Path) -> Sequence[object]:
         descriptors.append(stripped)
     return descriptors
 
-def load_index_descriptors(index_name: str, index_file: Optional[Path]) -> Sequence[object]:
+def load_index_descriptors(
+    index_name: str,
+    index_file: Optional[Path],
+    mongo_manager: Optional["MongoManager"],
+) -> Sequence[object]:
+    if index_file and index_file.exists():
+        return read_index_file(index_file)
+
+    if mongo_manager is not None:
+        descriptors = mongo_manager.fetch_index(index_name)
+        if descriptors is not None:
+            return descriptors
+        if index_file and index_file.exists():
+            return read_index_file(index_file)
+        raise KeyError(
+            f"Index '{index_name}' not found in Mongo collection '{mongo_manager.index_collection}'."
+        )
+
     path_candidate = Path(index_name)
     if path_candidate.exists():
         return read_index_file(path_candidate)
-    if index_file and index_file.exists():
-        data = json.loads(index_file.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            if index_name not in data:
-                raise KeyError(f"Index '{index_name}' not found in {index_file}.")
-            return data[index_name]
-        if isinstance(data, list):
-            return data
-        raise TypeError("Invalid index file format; expected list or dict.")
+
     raise FileNotFoundError(
-        f"Unable to locate index '{index_name}'. Provide a file path or populate {index_file}."
+        f"Unable to resolve index '{index_name}'. Provide a valid --index-file backup or ensure Mongo contains the mapping."
     )
 
 def normalize_code(value: Optional[str]) -> Optional[str]:
@@ -312,6 +351,7 @@ def resolve_constituents(
     index_name: str,
     corporate_actions: List[dict],
     index_file: Optional[Path],
+    mongo_manager: Optional["MongoManager"],
 ) -> List[CompanyTarget]:
     index_lower = index_name.lower()
     by_bse, by_nse = build_corporate_lookup(corporate_actions)
@@ -338,7 +378,7 @@ def resolve_constituents(
             )
         targets.sort(key=lambda item: (item.name or "", item.sc_bse_id or "", item.sc_nse_id or ""))
         return targets
-    descriptors = load_index_descriptors(index_name, index_file)
+    descriptors = load_index_descriptors(index_name, index_file, mongo_manager)
     for descriptor in descriptors:
         bse, nse = parse_constituent_descriptor(descriptor)
         bse = normalize_code(bse)
@@ -381,7 +421,7 @@ def append_section_results(
     df: pd.DataFrame,
     metadata: Dict[str, object],
     results_dir: Path,
-    mongo_writer: Optional["MongoWriter"] = None,
+    mongo_manager: Optional["MongoManager"] = None,
 ) -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
     enriched_df = df.copy()
@@ -439,9 +479,9 @@ def append_section_results(
     result_df.sort_values(by=KEY_COLUMNS, inplace=True)
     result_df.to_json(target_path, orient="records", force_ascii=False, indent=2)
 
-    if mongo_writer is not None:
+    if mongo_manager is not None:
         try:
-            mongo_writer.write(section, new_records_df)
+            mongo_manager.write_section(section, new_records_df)
         except Exception as exc:  # pragma: no cover - warn only
             print(
                 f"Warning: Failed to write data for section '{section}' to MongoDB: {exc}",
@@ -476,7 +516,7 @@ def scrape_company(
     index_name: str,
     consolidated: bool,
     results_dir: Path,
-    mongo_writer: Optional["MongoWriter"] = None,
+    mongo_manager: Optional["MongoManager"] = None,
 ) -> bool:
     slug_candidates: List[Tuple[str, str]] = []
     if target.sc_bse_id:
@@ -503,7 +543,7 @@ def scrape_company(
                 "ISINID": target.isin_id or normalize_code(target.corporate_entry.get("SC_ISINID")) or "",
             }
             for section_name, df in tables.items():
-                append_section_results(section_name, df, metadata, results_dir, mongo_writer)
+                append_section_results(section_name, df, metadata, results_dir, mongo_manager)
             return True
         except requests.HTTPError as exc:
             last_error = exc
@@ -527,7 +567,7 @@ def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--index-file",
         default=str(DEFAULT_INDEX_FILE),
-        help="Optional JSON mapping of index names to constituents (default: %(default)s)",
+        help="Optional backup JSON mapping of index names to constituents; Mongo is used when this file is absent.",
     )
     parser.add_argument(
         "--corporate-actions",
@@ -569,49 +609,84 @@ def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = read_args(argv)
     consolidated = not args.standalone
+
     corporate_actions_path = Path(args.corporate_actions)
     if not corporate_actions_path.exists():
         print(f"Corporate actions file not found: {corporate_actions_path}", file=sys.stderr)
         return 1
     corporate_actions = load_corporate_actions(corporate_actions_path)
-    index_file_path = Path(args.index_file) if args.index_file else None
-    try:
-        targets = resolve_constituents(args.index, corporate_actions, index_file_path)
-    except Exception as exc:
-        print(f"Error while resolving index constituents: {exc}", file=sys.stderr)
-        return 1
-    if not targets:
-        print(f"No companies resolved for index '{args.index}'.", file=sys.stderr)
-        return 1
-    if args.limit is not None:
-        targets = targets[: args.limit]
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
 
-    mongo_writer: Optional["MongoWriter"] = None
-    if not args.disable_mongo:
+    index_file_path: Optional[Path] = None
+    index_collection: Optional[str] = None
+    if args.index_file:
+        candidate = Path(args.index_file)
+        if candidate.exists():
+            index_file_path = candidate
+        elif args.index_file == str(DEFAULT_INDEX_FILE):
+            index_collection = DEFAULT_INDEX_COLLECTION
+        else:
+            index_collection = args.index_file
+    if index_collection is None:
+        index_collection = DEFAULT_INDEX_COLLECTION
+
+    enable_writes = not args.disable_mongo
+    need_mongo_for_index = index_file_path is None
+    mongo_manager: Optional["MongoManager"] = None
+
+    if need_mongo_for_index or enable_writes:
         mongo_uri = args.mongo_uri or DEFAULT_MONGO_URI
         mongo_db = args.mongo_db or DEFAULT_MONGO_DB
         try:
-            mongo_writer = MongoWriter(mongo_uri, mongo_db)
+            mongo_manager = MongoManager(
+                mongo_uri,
+                mongo_db,
+                index_collection,
+                enable_writes=enable_writes,
+            )
         except Exception as exc:
-            print(f"Error connecting to MongoDB: {exc}. Use --disable-mongo to skip database writes.", file=sys.stderr)
-            return 1
+            if need_mongo_for_index:
+                print(f"Error connecting to MongoDB: {exc}", file=sys.stderr)
+                return 1
+            print(
+                f"Warning: Failed to connect to MongoDB ({exc}). Continuing without database writes.",
+                file=sys.stderr,
+            )
+            mongo_manager = None
+            enable_writes = False
+
+    try:
+        targets = resolve_constituents(args.index, corporate_actions, index_file_path, mongo_manager)
+    except Exception as exc:
+        print(f"Error while resolving index constituents: {exc}", file=sys.stderr)
+        return 1
+
+    if not targets:
+        print(f"No companies resolved for index '{args.index}'.", file=sys.stderr)
+        return 1
+
+    if args.limit is not None:
+        targets = targets[: args.limit]
+
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
 
     exceptions: List[Tuple[str, str]] = []
     processed = 0
     with requests.Session() as session:
         for target in tqdm(targets, desc=f"Scraping {args.index}", unit="company"):
-            success = scrape_company(session, target, args.index, consolidated, results_dir, mongo_writer)
+            success = scrape_company(session, target, args.index, consolidated, results_dir, mongo_manager)
             if success:
                 processed += 1
             else:
                 exceptions.append((target.sc_bse_id or "", target.sc_nse_id or ""))
+
     if exceptions:
         update_exception_file(results_dir / "exceptions.txt", exceptions)
         print(f"Recorded {len(exceptions)} failures to {results_dir / 'exceptions.txt'}")
+
     print(f"Scraped {processed} companies for index '{args.index}'.")
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

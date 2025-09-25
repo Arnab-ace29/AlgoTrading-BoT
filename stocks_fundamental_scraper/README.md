@@ -49,7 +49,7 @@ Index constituents can be provided in several ways:
 1. `--index all` ? scrape every company present in the corporate action dataset.
 2. `--index path/to/list.txt` ? text file with one entry per line (`BSEID,NSEID`, `BSEID`, or `NSEID`).
 3. `--index path/to/index.json` ? JSON list or dict containing the same descriptor strings/dicts.
-4. `--index NIFTY50 --index-file stocks_fundamental_scraper/index_constituents.json` ? lookup an index name inside a JSON mapping.
+4. `--index NIFTY50 --index-file index_constituents` ? fetch constituents from the Mongo collection (falls back to JSON when provided).
 
 Each descriptor may be a dict with `SC_BSEID`, `SC_NSEID`, `SC_ISINID` fields, or a comma-separated pair (`500325,RELIANCE`).
 
@@ -65,7 +65,7 @@ python scrape_screener.py --index all --limit 10
 | Flag | Description |
 |------|-------------|
 | `--index` | Index name or path to the constituent list (required). |
-| `--index-file` | Optional JSON mapping of index names to constituent lists (defaults to `index_constituents.json`). |
+| `--index-file` | Optional backup JSON map; Mongo is queried first using the configured collection. |
 | `--corporate-actions` | Path to the Moneycontrol corporate actions JSON (default `../scraper/Historic Data/moneycontrol_corporate_actions.json`). |
 | `--results-dir` | Directory for JSON collections (`collections` by default). |
 | `--limit` | Restrict the number of companies (useful for smoke-tests). |

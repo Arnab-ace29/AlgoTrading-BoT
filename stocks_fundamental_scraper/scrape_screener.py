@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import random
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 from io import StringIO
@@ -13,7 +15,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from requests import Session
+from requests import Session, HTTPError
 from tqdm import tqdm
 
 try:
@@ -63,6 +65,159 @@ SECTION_COLLECTION_NAMES = {
     "quarters": "quarters",
     "ratios": "ratios",
 }
+
+class RateLimiter:
+    """Simple helper to space outbound HTTP requests."""
+
+    def __init__(self, min_delay: float, max_delay: float, jitter: float = 0.0) -> None:
+        self.min_delay = max(0.0, min_delay)
+        self.max_delay = max(self.min_delay, max_delay)
+        self.jitter = max(0.0, jitter)
+        self._next_allowed = time.monotonic()
+
+    def wait(self) -> None:
+        now = time.monotonic()
+        if now < self._next_allowed:
+            time.sleep(self._next_allowed - now)
+            now = time.monotonic()
+        delay = random.uniform(self.min_delay, self.max_delay) if self.max_delay > 0 else 0.0
+        jitter = random.uniform(0.0, self.jitter) if self.jitter > 0 else 0.0
+        self._next_allowed = now + delay + jitter
+
+    def penalise(self, extra_delay: float) -> None:
+        extra = max(0.0, extra_delay)
+        if extra <= 0:
+            return
+        now = time.monotonic()
+        self._next_allowed = max(self._next_allowed, now) + extra
+
+
+class ProxyManager:
+    """Round-robin proxy helper for rotating outbound requests."""
+
+    def __init__(self, proxies: Sequence[str]) -> None:
+        self._proxies = [proxy.strip() for proxy in proxies if proxy and proxy.strip()]
+        if len(self._proxies) > 1:
+            random.shuffle(self._proxies)
+        self._cursor = 0
+
+    def current(self) -> Optional[str]:
+        if not self._proxies:
+            return None
+        return self._proxies[self._cursor % len(self._proxies)]
+
+    def for_requests(self) -> Optional[Dict[str, str]]:
+        current = self.current()
+        if not current:
+            return None
+        return {"http": current, "https": current}
+
+    def rotate(self) -> None:
+        if self._proxies:
+            self._cursor = (self._cursor + 1) % len(self._proxies)
+
+    def __bool__(self) -> bool:  # pragma: no cover - convenience
+        return bool(self._proxies)
+
+
+def load_proxy_list(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Proxy list file not found: {path}")
+    proxies: List[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        trimmed = line.strip()
+        if not trimmed or trimmed.startswith("#"):
+            continue
+        proxies.append(trimmed)
+    return proxies
+
+
+def request_with_backoff(
+    session: Session,
+    url: str,
+    *,
+    method: str = "GET",
+    params: Optional[Dict[str, object]] = None,
+    rate_limiter: Optional["RateLimiter"] = None,
+    proxy_manager: Optional["ProxyManager"] = None,
+    retry_limit: int = 3,
+    backoff_base: float = 3.0,
+    backoff_cap: float = 60.0,
+    allowed_statuses: Optional[Sequence[int]] = None,
+    timeout: float = 30.0,
+) -> requests.Response:
+    """Fire an HTTP request with throttling + exponential backoff, respecting Screener's limits."""
+    allowed = set(allowed_statuses or [])
+    last_error: Optional[Exception] = None
+
+    max_attempts = max(1, retry_limit)
+    for attempt in range(max_attempts):
+        if rate_limiter is not None:
+            rate_limiter.wait()
+        proxies = proxy_manager.for_requests() if proxy_manager else None
+        status_code: Optional[int] = None
+        try:
+            response = session.request(
+                method,
+                url,
+                params=params,
+                headers=HEADERS,
+                timeout=timeout,
+                proxies=proxies,
+            )
+        except requests.exceptions.RequestException as exc:  # pragma: no cover - network dependent
+            last_error = exc
+        else:
+            status_code = response.status_code
+            if status_code in allowed:
+                return response
+            if status_code == 429 or status_code >= 500:
+                last_error = HTTPError(f"{status_code} Error", response=response)
+            elif status_code < 400:
+                return response
+            else:
+                response.raise_for_status()
+                return response
+
+        if isinstance(last_error, HTTPError) and getattr(last_error, "response", None) is not None and status_code is None:
+            status_code = last_error.response.status_code
+
+        delay = min(backoff_base * (2 ** attempt), backoff_cap)
+        if isinstance(last_error, HTTPError) and getattr(last_error, "response", None) is not None:
+            retry_after = last_error.response.headers.get("Retry-After") if last_error.response else None
+            if retry_after:
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    pass
+
+        if status_code == 429:
+            # Screener explicitly throttled us; extend the wait window aggressively before retrying.
+            delay = max(delay, max(backoff_base, 5.0))
+        elif status_code is not None and status_code >= 500:
+            delay = max(delay, backoff_base if backoff_base > 0 else 2.0)
+        elif delay <= 0 and not isinstance(last_error, HTTPError):
+            delay = max(backoff_base, 1.0)
+
+        delay = max(0.0, delay)
+        jitter = random.uniform(0.0, 1.0) if delay > 0 else 0.0
+        total_sleep = delay + jitter
+
+        if rate_limiter is not None and total_sleep > 0:
+            rate_limiter.penalise(total_sleep)
+        elif total_sleep > 0:
+            time.sleep(total_sleep)
+
+        if proxy_manager and (status_code == 429 or isinstance(last_error, requests.exceptions.RequestException)):
+            proxy_manager.rotate()
+
+        if attempt + 1 >= max_attempts:
+            break
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Request to {url} failed without an explicit error")
+
 
 def extract_identifiers(entry: Dict[str, object]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     if not isinstance(entry, dict):
@@ -165,13 +320,39 @@ def build_record(
 
 
 
-def fetch_company_page(session: Session, slug: str, consolidated: bool) -> Tuple[str, BeautifulSoup]:
+def fetch_company_page(
+    session: Session,
+    slug: str,
+    consolidated: bool,
+    *,
+    rate_limiter: Optional["RateLimiter"] = None,
+    proxy_manager: Optional["ProxyManager"] = None,
+    retry_limit: int = 3,
+    backoff_base: float = 3.0,
+    backoff_cap: float = 60.0,
+) -> Tuple[str, BeautifulSoup]:
     url = f"{BASE_URL}/company/{slug}/"
     if consolidated:
         url += "consolidated/"
-    response = session.get(url, headers=HEADERS, timeout=30)
+    response = request_with_backoff(
+        session,
+        url,
+        rate_limiter=rate_limiter,
+        proxy_manager=proxy_manager,
+        retry_limit=retry_limit,
+        backoff_base=backoff_base,
+        backoff_cap=backoff_cap,
+    )
     response.raise_for_status()
     return response.url.rstrip("/"), BeautifulSoup(response.text, "html.parser")
+
+def extract_slug_from_url(url: str) -> str:
+    """Extract Screener slug from a canonical company URL."""
+    cleaned = url.rstrip("/")
+    if "/company/" not in cleaned:
+        return cleaned.rsplit("/", 1)[-1]
+    tail = cleaned.split("/company/", 1)[1]
+    return tail.split("/", 1)[0]
 
 def extract_company_id(soup: BeautifulSoup) -> str:
     container = soup.find("div", id="company-info")
@@ -184,10 +365,32 @@ def fetch_child_schedule(
     company_id: str,
     section: str,
     parent_name: str,
+    *,
+    consolidated: bool,
+    rate_limiter: Optional["RateLimiter"] = None,
+    proxy_manager: Optional["ProxyManager"] = None,
+    retry_limit: int = 3,
+    backoff_base: float = 3.0,
+    backoff_cap: float = 60.0,
 ) -> Dict[str, Dict[str, object]]:
     url = f"{BASE_URL}/api/company/{company_id}/schedules/"
-    params = {"parent": parent_name, "section": section, "consolidated": ""}
-    response = session.get(url, params=params, headers=HEADERS, timeout=30)
+    params = {
+        "parent": parent_name,
+        "section": section,
+        "consolidated": "" if consolidated else "0",
+    }
+    response = request_with_backoff(
+        session,
+        url,
+        method="GET",
+        params=params,
+        rate_limiter=rate_limiter,
+        proxy_manager=proxy_manager,
+        retry_limit=retry_limit,
+        backoff_base=backoff_base,
+        backoff_cap=backoff_cap,
+        allowed_statuses=(404,),
+    )
     if response.status_code != 200:
         return {}
     data = response.json()
@@ -198,6 +401,8 @@ def parse_section_table(
     company_id: str,
     section: str,
     section_tag,
+    consolidated: bool,
+    request_kwargs: Dict[str, object],
 ) -> Optional[pd.DataFrame]:
     table_tag = section_tag.find("table") if section_tag else None
     if table_tag is None:
@@ -216,7 +421,14 @@ def parse_section_table(
             records.append(
                 build_record(parent_name or "", parent_name or metric, "Parent", value_columns, parent_values)
             )
-            child_map = fetch_child_schedule(session, company_id, section, parent_name)
+            child_map = fetch_child_schedule(
+                session,
+                company_id,
+                section,
+                parent_name,
+                consolidated=consolidated,
+                **request_kwargs,
+            )
             if not child_map:
                 continue
             for child_name, metrics in child_map.items():
@@ -238,11 +450,13 @@ def collect_section_tables(
     session: Session,
     soup: BeautifulSoup,
     company_id: str,
+    consolidated: bool,
+    request_kwargs: Dict[str, object],
 ) -> Dict[str, pd.DataFrame]:
     output: Dict[str, pd.DataFrame] = {}
     for section in SECTIONS:
         section_tag = soup.select_one(f"section#{section}")
-        df = parse_section_table(session, company_id, section, section_tag)
+        df = parse_section_table(session, company_id, section, section_tag, consolidated, request_kwargs)
         if df is not None:
             output[section] = df
     return output
@@ -267,9 +481,10 @@ def build_corporate_lookup(corporate_actions: Iterable[dict]) -> Tuple[Dict[str,
     by_bse: Dict[str, dict] = {}
     by_nse: Dict[str, dict] = {}
     for entry in corporate_actions:
-        bse_id = entry.get("SC_BSEID")
-        nse_id = entry.get("SC_NSEID")
-        if bse_id and bse_id != "0":
+        bse_id, nse_id, _ = extract_identifiers(entry)
+        bse_id = normalize_code(bse_id)
+        nse_id = normalize_code(nse_id)
+        if bse_id:
             by_bse[bse_id] = entry
         if nse_id:
             by_nse[nse_id] = entry
@@ -346,13 +561,13 @@ class SourceMongo:
         records: List[dict] = []
         for doc in documents:
             if isinstance(doc, dict):
-                if any(doc.get(key) for key in ("SC_BSEID", "SC_NSEID", "SC_ISINID")):
+                if any(normalize_code(value) for value in extract_identifiers(doc)):
                     records.append(doc)
                 for key in ("constituents", "members", "companies", "items", "entries", "data"):
                     payload = doc.get(key)
                     if isinstance(payload, list):
                         for item in payload:
-                            if isinstance(item, dict):
+                            if isinstance(item, dict) and any(normalize_code(val) for val in extract_identifiers(item)):
                                 records.append(item)
         return records
 
@@ -458,8 +673,10 @@ def resolve_constituents(
         if source_mongo is not None:
             source_records = source_records or source_mongo.fetch_all_companies()
         for entry in source_records:
-            bse = normalize_code(entry.get("SC_BSEID"))
-            nse = normalize_code(entry.get("SC_NSEID"))
+            bse_raw, nse_raw, isin_raw = extract_identifiers(entry)
+            bse = normalize_code(bse_raw)
+            nse = normalize_code(nse_raw)
+            isin = normalize_code(isin_raw)
             pair = (bse or "", nse or "")
             if not pair[0] and not pair[1]:
                 continue
@@ -468,10 +685,10 @@ def resolve_constituents(
             seen_pairs.add(pair)
             targets.append(
                 CompanyTarget(
-                    name=entry.get("name", entry.get("shortName", entry.get("Name", ""))),
+                    name=entry.get("name", entry.get("shortName", entry.get("Name", entry.get("companyName", "")))),
                     sc_bse_id=bse,
                     sc_nse_id=nse,
-                    isin_id=normalize_code(entry.get("SC_ISINID")),
+                    isin_id=isin,
                     corporate_entry=entry,
                 )
             )
@@ -486,22 +703,26 @@ def resolve_constituents(
         entry = None
         if bse and bse in by_bse:
             entry = by_bse[bse]
-            nse = nse or normalize_code(entry.get("SC_NSEID"))
         elif nse and nse in by_nse:
             entry = by_nse[nse]
-            bse = bse or normalize_code(entry.get("SC_BSEID"))
         if not entry:
             raise KeyError(f"Unable to locate corporate action entry for descriptor '{descriptor}'.")
+        entry_bse, entry_nse, entry_isin = extract_identifiers(entry)
+        entry_bse = normalize_code(entry_bse)
+        entry_nse = normalize_code(entry_nse)
+        isin = normalize_code(entry_isin)
+        bse = bse or entry_bse
+        nse = nse or entry_nse
         pair = (bse or "", nse or "")
         if pair in seen_pairs:
             continue
         seen_pairs.add(pair)
         targets.append(
             CompanyTarget(
-                name=entry.get("name", entry.get("shortName", "")),
+                name=entry.get("name", entry.get("shortName", entry.get("Name", entry.get("companyName", "")))),
                 sc_bse_id=bse,
                 sc_nse_id=nse,
-                isin_id=normalize_code(entry.get("SC_ISINID")),
+                isin_id=isin,
                 corporate_entry=entry,
             )
         )
@@ -604,6 +825,7 @@ def update_exception_file(path: Path, new_exceptions: Iterable[Tuple[str, str]])
         for bse, nse in sorted(existing):
             handle.write(f"{bse},{nse}\n")
 
+
 def scrape_company(
     session: Session,
     target: CompanyTarget,
@@ -611,7 +833,22 @@ def scrape_company(
     consolidated: bool,
     results_dir: Optional[Path],
     target_mongo: Optional["TargetMongo"] = None,
+    *,
+    rate_limiter: Optional["RateLimiter"] = None,
+    proxy_manager: Optional["ProxyManager"] = None,
+    retry_limit: int = 3,
+    backoff_base: float = 3.0,
+    backoff_cap: float = 60.0,
 ) -> bool:
+    """Fetch every Screener section for a company, retrying aggressively when throttled."""
+    request_kwargs: Dict[str, object] = {
+        "rate_limiter": rate_limiter,
+        "proxy_manager": proxy_manager,
+        "retry_limit": retry_limit,
+        "backoff_base": backoff_base,
+        "backoff_cap": backoff_cap,
+    }
+
     slug_candidates: List[Tuple[str, str]] = []
     if target.sc_bse_id:
         slug_candidates.append(("BSE", target.sc_bse_id))
@@ -619,33 +856,55 @@ def scrape_company(
         slug_candidates.append(("NSE", target.sc_nse_id))
     last_error: Optional[Exception] = None
     for slug_source, slug in slug_candidates:
-        try:
-            final_url, soup = fetch_company_page(session, slug, consolidated)
-            company_id = extract_company_id(soup)
-            tables = collect_section_tables(session, soup, company_id)
-            if not tables:
-                raise ValueError("No tables found on Screener page.")
-            resolved_slug = extract_slug_from_url(final_url)
-            metadata = {
-                "Index": index_name,
-                "Company Name": target.name,
-                "Company ID": company_id,
-                "Resolved Slug": resolved_slug,
-                "Slug Source": slug_source,
-                "BSEID": target.sc_bse_id or "",
-                "NSEID": target.sc_nse_id or "",
-                "ISINID": target.isin_id or normalize_code(target.corporate_entry.get("SC_ISINID")) or "",
-            }
-            for section_name, df in tables.items():
-                append_section_results(section_name, df, metadata, results_dir, target_mongo)
-            return True
-        except requests.HTTPError as exc:
-            last_error = exc
-            if exc.response is not None and exc.response.status_code == 404:
-                continue
-            raise
-        except Exception as exc:  # pragma: no cover - safety net for data glitches
-            last_error = exc
+        attempts = max(1, retry_limit)
+        attempt = 0
+        while attempt < attempts:
+            # Keep retrying the same slug when Screener responds with 429 so data is not skipped.
+            try:
+                final_url, soup = fetch_company_page(
+                    session,
+                    slug,
+                    consolidated,
+                    **request_kwargs,
+                )
+                company_id = extract_company_id(soup)
+                tables = collect_section_tables(session, soup, company_id, consolidated, request_kwargs)
+                if not tables:
+                    raise ValueError("No tables found on Screener page.")
+                resolved_slug = extract_slug_from_url(final_url)
+                metadata = {
+                    "Index": index_name,
+                    "Company Name": target.name,
+                    "Company ID": company_id,
+                    "Resolved Slug": resolved_slug,
+                    "Slug Source": slug_source,
+                    "BSEID": target.sc_bse_id or "",
+                    "NSEID": target.sc_nse_id or "",
+                    "ISINID": target.isin_id or normalize_code(target.corporate_entry.get("SC_ISINID")) or "",
+                }
+                for section_name, df in tables.items():
+                    append_section_results(section_name, df, metadata, results_dir, target_mongo)
+                return True
+            except HTTPError as exc:
+                last_error = exc
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code == 404:
+                    break
+                if status_code == 429:
+                    penalty = max(backoff_cap, backoff_base * 2 if backoff_base > 0 else 10.0)
+                    if rate_limiter is not None:
+                        rate_limiter.penalise(penalty)
+                    else:
+                        time.sleep(penalty)
+                    attempt += 1
+                    continue
+                raise
+            except Exception as exc:  # pragma: no cover - safety net for data glitches
+                last_error = exc
+                break
+            attempt += 1
+        if last_error and isinstance(last_error, HTTPError) and last_error.response is not None and last_error.response.status_code == 404:
+            continue
     if last_error is not None:
         bse = target.sc_bse_id or ""
         nse = target.sc_nse_id or ""
@@ -654,6 +913,7 @@ def scrape_company(
             file=sys.stderr,
         )
     return False
+
 
 def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scrape Screener tables into CSV files.")
@@ -697,6 +957,46 @@ def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--target-mongo-db",
         default=DEFAULT_TARGET_MONGO_DB,
         help="Target Mongo database where section collections live (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--min-delay",
+        type=float,
+        default=1.0,
+        help="Minimum spacing (seconds) between outbound requests (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max-delay",
+        type=float,
+        default=2.5,
+        help="Maximum spacing (seconds) between outbound requests (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--delay-jitter",
+        type=float,
+        default=0.5,
+        help="Additional random jitter (seconds) added to request spacing (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--retry-limit",
+        type=int,
+        default=5,
+        help="Maximum number of attempts per HTTP request before giving up (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=3.0,
+        help="Base backoff interval (seconds) multiplied exponentially between retries (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--retry-cap",
+        type=float,
+        default=60.0,
+        help="Maximum backoff interval (seconds) between retries (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--proxy-file",
+        help="Optional path to newline-delimited HTTP proxies (http[s]://user:pass@host:port).",
     )
     parser.add_argument(
         "--disable-mongo",
@@ -756,6 +1056,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if candidate.exists():
             index_file_path = candidate
 
+    min_delay = max(0.0, args.min_delay if args.min_delay is not None else 0.0)
+    max_delay = max(min_delay, args.max_delay if args.max_delay is not None else min_delay)
+    jitter = max(0.0, args.delay_jitter if args.delay_jitter is not None else 0.0)
+    rate_limiter: Optional[RateLimiter] = None
+    if (min_delay > 0) or (max_delay > 0) or (jitter > 0):
+        rate_limiter = RateLimiter(min_delay, max_delay, jitter)
+
+    proxy_manager: Optional[ProxyManager] = None
+    if args.proxy_file:
+        proxy_path = Path(args.proxy_file)
+        proxy_values: List[str] = []
+        try:
+            proxy_values = load_proxy_list(proxy_path)
+        except FileNotFoundError as exc:
+            print(f"Warning: {exc}", file=sys.stderr)
+        else:
+            if proxy_values:
+                proxy_manager = ProxyManager(proxy_values)
+            else:
+                print(f"Warning: No usable proxies found in {proxy_path}", file=sys.stderr)
+
+    retry_limit = max(1, args.retry_limit if args.retry_limit is not None else 1)
+    backoff_base = max(0.0, args.retry_backoff if args.retry_backoff is not None else 0.0)
+    backoff_cap = max(backoff_base, args.retry_cap if args.retry_cap is not None else backoff_base)
+
     enable_target_writes = not args.disable_mongo
     target_mongo: Optional[TargetMongo] = None
     if enable_target_writes:
@@ -789,7 +1114,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     if args.limit is not None:
-        targets = targets[: args.limit]
+        if args.limit > 0:
+            targets = targets[: args.limit]
+        elif args.limit == 0:
+            print("Warning: --limit 0 interpreted as unlimited; ignoring the limit.")
 
     results_dir: Optional[Path] = None
     if args.results_dir:
@@ -807,6 +1135,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 consolidated,
                 results_dir,
                 target_mongo,
+                rate_limiter=rate_limiter,
+                proxy_manager=proxy_manager,
+                retry_limit=retry_limit,
+                backoff_base=backoff_base,
+                backoff_cap=backoff_cap,
             )
             if success:
                 processed += 1

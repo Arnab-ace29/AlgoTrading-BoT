@@ -6,7 +6,7 @@ Python utility for collecting fundamentals from [Screener.in](https://www.screen
 
 - Scrape multiple Screener sections (`quarters`, `profit-loss`, `balance-sheet`, `cash-flow`, `ratios`) for every company in a supplied index list.
 - Expand child KPI schedules under each parent row and track parent/child relationships explicitly.
-- Export section data to JSON collections under `collections/`, maintaining historical rows without duplicates.
+- Optionally export section data to JSON snapshots when `--results-dir` is supplied; otherwise persist directly to Mongo.
 - Optional MongoDB upserts (defaulting to `mongodb://localhost:27017` database `screener`) with upsert keys based on index, slug, BSEID, NSEID, and ISINID.
 - Cleans numeric strings (removing commas, percents, currency symbols) so values merge cleanly with other data sources.
 - Resilient to reruns: missing sections are skipped, existing documents are updated in place, and failed lookups are captured in `collections/exceptions.txt`.
@@ -68,7 +68,7 @@ python scrape_screener.py --index all --limit 10
 | `--index-file` | Optional backup JSON map; Mongo is queried first using the configured collection. |
 | `--corporate-actions` | Optional backup JSON file; Mongo supplies corporate metadata when this file is absent. |
 | `--corporate-collection` | MongoDB collection containing corporate metadata (default `corporate_actions`). |
-| `--results-dir` | Directory for JSON collections (`collections` by default). |
+| `--results-dir` | Optional directory for JSON snapshots; leave unset to skip local files. |
 | `--limit` | Restrict the number of companies (useful for smoke-tests). |
 | `--standalone` | Fetch standalone rather than consolidated numbers. |
 | `--mongo-uri` | MongoDB URI (defaults to `mongodb://localhost:27017`). |
@@ -77,13 +77,13 @@ python scrape_screener.py --index all --limit 10
 
 ### Examples
 
-Scrape NIFTY 50 constituents listed in `index_constituents.json`, keep consolidated figures, and write to Mongo:
+Scrape NIFTY 50 constituents resolved from the Mongo collection (`index_constituents`), keep consolidated figures, and write to Mongo:
 
 ```bash
 python scrape_screener.py --index NIFTY50
 ```
 
-Smoke-test the scraper on five companies, output JSON only:
+Smoke-test the scraper on five companies without touching Mongo or writing local snapshots:
 
 ```bash
 python scrape_screener.py --index all --limit 5 --disable-mongo
@@ -97,7 +97,7 @@ python scrape_screener.py --index BANKNIFTY --standalone
 
 ## Output Structure
 
-- `collections/<section>.json` ? JSON array per section (`balance-sheet`, `cash-flow`, `profit-loss`, `quarters`, `ratios`).
+- If you pass `--results-dir=/path/to/snapshots`, each section is written to `/path/to/snapshots/<section>.json` (`balance-sheet`, `cash-flow`, `profit-loss`, `quarters`, `ratios`).
 - Each document includes the following merge-friendly identifiers:
   - `BSEID`, `NSEID`, `ISINID`
   - `Resolved Slug`, `Slug Source`
@@ -122,7 +122,7 @@ Upsert keys mirror the JSON identifiers (`Index`, `Resolved Slug`, `BSEID`, `NSE
 
 - Screener occasionally throttles requests; respect their terms and keep scrape volumes reasonable.
 - If you notice pages missing sections, Screener may have no data or may have changed layout. The scraper logs failures and continues.
-- To regenerate clean JSON collections, delete the existing `collections/*.json` files and rerun.
+- If you use `--results-dir`, delete the snapshot files there to regenerate clean JSON on the next run.
 - Use `--disable-mongo` whenever MongoDB is unavailable or credentials are incorrect.
 
 ## Contributing / Next Steps

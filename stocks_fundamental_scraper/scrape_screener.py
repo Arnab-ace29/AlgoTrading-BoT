@@ -32,7 +32,7 @@ SECTIONS = [
 ]
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 OUTPUT_DIR = Path(__file__).resolve().parent
-DEFAULT_RESULTS_DIR = OUTPUT_DIR / "collections"
+DEFAULT_RESULTS_DIR = None  # local collections disabled; Mongo only
 DEFAULT_CORPORATE_ACTIONS_PATH = Path("scraper") / "Historic Data" / "moneycontrol_corporate_actions.json"
 DEFAULT_INDEX_FILE = OUTPUT_DIR / "index_constituents.json"
 DEFAULT_INDEX_COLLECTION = "index_constituents"
@@ -440,10 +440,9 @@ def append_section_results(
     section: str,
     df: pd.DataFrame,
     metadata: Dict[str, object],
-    results_dir: Path,
+    results_dir: Optional[Path],
     mongo_manager: Optional["MongoManager"] = None,
 ) -> None:
-    results_dir.mkdir(parents=True, exist_ok=True)
     enriched_df = df.copy()
     for column, value in metadata.items():
         enriched_df[column] = "" if value is None else value
@@ -455,49 +454,52 @@ def append_section_results(
     enriched_df[["Parent KPI", "Child KPI"]] = enriched_df[["Parent KPI", "Child KPI"]].fillna("")
     enriched_df = enriched_df.fillna("").astype(str)
 
-    target_path = results_dir / f"{section}.json"
-    key_columns = KEY_COLUMNS
-    if target_path.exists():
-        try:
-            existing_df = pd.read_json(target_path, orient="records")
-        except ValueError:
-            existing_df = pd.DataFrame(columns=enriched_df.columns)
-        else:
-            existing_df = existing_df.fillna("")
-            if "Company ID" not in existing_df.columns:
+    new_records_df = enriched_df.copy()
+
+    if results_dir is not None:
+        results_dir.mkdir(parents=True, exist_ok=True)
+        target_path = results_dir / f"{section}.json"
+        key_columns = KEY_COLUMNS
+        if target_path.exists():
+            try:
+                existing_df = pd.read_json(target_path, orient="records")
+            except ValueError:
                 existing_df = pd.DataFrame(columns=enriched_df.columns)
             else:
-                existing_df = existing_df.astype(str)
-                existing_df = existing_df[existing_df["Company ID"].str.strip() != ""]
-            rename_map = {
-                "Screener Slug": "Resolved Slug",
-                "SC_BSEID": "BSEID",
-                "SC_NSEID": "NSEID",
-                "SC_ISINID": "ISINID",
-            }
-            existing_df = existing_df.rename(columns={k: v for k, v in rename_map.items() if k in existing_df.columns})
-        if {"Row Type", "Parent KPI", "Child KPI"}.issubset(existing_df.columns):
-            mask_standalone_fix = (existing_df["Row Type"] == "Standalone") & (existing_df["Parent KPI"].astype(str).str.strip() == "")
-            existing_df.loc[mask_standalone_fix, "Parent KPI"] = existing_df.loc[mask_standalone_fix, "Child KPI"]
-            existing_df.loc[mask_standalone_fix, "Child KPI"] = ""
-            mask_same = (existing_df["Row Type"] == "Parent") & (existing_df["Parent KPI"] == existing_df["Child KPI"])
-            mask_blank = (existing_df["Row Type"] == "Parent") & (existing_df["Parent KPI"].astype(str).str.strip() == "")
-            existing_df = existing_df.loc[~(mask_same | mask_blank)]
-    else:
-        existing_df = pd.DataFrame(columns=enriched_df.columns)
+                existing_df = existing_df.fillna("")
+                if "Company ID" not in existing_df.columns:
+                    existing_df = pd.DataFrame(columns=enriched_df.columns)
+                else:
+                    existing_df = existing_df.astype(str)
+                    existing_df = existing_df[existing_df["Company ID"].str.strip() != ""]
+                rename_map = {
+                    "Screener Slug": "Resolved Slug",
+                    "SC_BSEID": "BSEID",
+                    "SC_NSEID": "NSEID",
+                    "SC_ISINID": "ISINID",
+                }
+                existing_df = existing_df.rename(columns={k: v for k, v in rename_map.items() if k in existing_df.columns})
+            if {"Row Type", "Parent KPI", "Child KPI"}.issubset(existing_df.columns):
+                mask_standalone_fix = (existing_df["Row Type"] == "Standalone") & (existing_df["Parent KPI"].astype(str).str.strip() == "")
+                existing_df.loc[mask_standalone_fix, "Parent KPI"] = existing_df.loc[mask_standalone_fix, "Child KPI"]
+                existing_df.loc[mask_standalone_fix, "Child KPI"] = ""
+                mask_same = (existing_df["Row Type"] == "Parent") & (existing_df["Parent KPI"] == existing_df["Child KPI"])
+                mask_blank = (existing_df["Row Type"] == "Parent") & (existing_df["Parent KPI"].astype(str).str.strip() == "")
+                existing_df = existing_df.loc[~(mask_same | mask_blank)]
+        else:
+            existing_df = pd.DataFrame(columns=enriched_df.columns)
 
-    all_columns = list(dict.fromkeys([*key_columns, *existing_df.columns, *enriched_df.columns]))
-    existing_df = existing_df.reindex(columns=all_columns, fill_value="")
-    enriched_df = enriched_df.reindex(columns=all_columns, fill_value="")
-    new_records_df = enriched_df.copy()
-    existing_df.set_index(key_columns, inplace=True)
-    enriched_df.set_index(key_columns, inplace=True)
-    combined = existing_df.combine_first(enriched_df)
-    combined.update(enriched_df)
-    result_df = combined.reset_index()
-    result_df = result_df.fillna("").astype(str)
-    result_df.sort_values(by=KEY_COLUMNS, inplace=True)
-    result_df.to_json(target_path, orient="records", force_ascii=False, indent=2)
+        all_columns = list(dict.fromkeys([*key_columns, *existing_df.columns, *enriched_df.columns]))
+        existing_df = existing_df.reindex(columns=all_columns, fill_value="")
+        enriched_df = enriched_df.reindex(columns=all_columns, fill_value="")
+        existing_df.set_index(key_columns, inplace=True)
+        enriched_df.set_index(key_columns, inplace=True)
+        combined = existing_df.combine_first(enriched_df)
+        combined.update(enriched_df)
+        result_df = combined.reset_index()
+        result_df = result_df.fillna("").astype(str)
+        result_df.sort_values(by=KEY_COLUMNS, inplace=True)
+        result_df.to_json(target_path, orient="records", force_ascii=False, indent=2)
 
     if mongo_manager is not None:
         try:
@@ -601,8 +603,8 @@ def read_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--results-dir",
-        default=str(DEFAULT_RESULTS_DIR),
-        help="Directory to store output collection JSON files (default: %(default)s)",
+        default=None,
+        help="Optional directory for JSON snapshots; leave unset to rely solely on Mongo.",
     )
     parser.add_argument(
         "--mongo-uri",
@@ -709,8 +711,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.limit is not None:
         targets = targets[: args.limit]
 
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    results_dir: Optional[Path] = None
+    if args.results_dir:
+        results_dir = Path(args.results_dir)
+        results_dir.mkdir(parents=True, exist_ok=True)
 
     exceptions: List[Tuple[str, str]] = []
     processed = 0
@@ -723,8 +727,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 exceptions.append((target.sc_bse_id or "", target.sc_nse_id or ""))
 
     if exceptions:
-        update_exception_file(results_dir / "exceptions.txt", exceptions)
-        print(f"Recorded {len(exceptions)} failures to {results_dir / 'exceptions.txt'}")
+        if results_dir is not None:
+            exception_path = results_dir / "exceptions.txt"
+            update_exception_file(exception_path, exceptions)
+            print(f"Recorded {len(exceptions)} failures to {exception_path}")
+        else:
+            print(f"Recorded {len(exceptions)} failures (exceptions file disabled because --results-dir was not provided).")
 
     print(f"Scraped {processed} companies for index '{args.index}'.")
     return 0

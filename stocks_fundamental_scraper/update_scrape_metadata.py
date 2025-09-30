@@ -1,10 +1,13 @@
 """Enrich Screener scrape metadata with additional top-ratio KPIs."""
 
 import argparse
+import sys
+import random
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
@@ -21,6 +24,8 @@ try:  # Prefer shared constants when scrape_screener is importable
         SCRAPE_METADATA_COLLECTION,
         DEFAULT_TARGET_MONGO_URI,
         DEFAULT_TARGET_MONGO_DB,
+        ProxyManager,
+        load_proxy_list,
     )
 except ImportError:  # Fallback when executed standalone
     BASE_URL = "https://www.screener.in"
@@ -29,8 +34,44 @@ except ImportError:  # Fallback when executed standalone
     DEFAULT_TARGET_MONGO_URI = "mongodb://localhost:27017"
     DEFAULT_TARGET_MONGO_DB = "screener"
 
+    class ProxyManager:
+        def __init__(self, proxies: Iterable[str]) -> None:
+            self._proxies = [proxy.strip() for proxy in proxies if proxy and proxy.strip()]
+            self._cursor = 0
+
+        def for_requests(self) -> Optional[Dict[str, str]]:
+            if not self._proxies:
+                return None
+            proxy = self._proxies[self._cursor % len(self._proxies)]
+            return {"http": proxy, "https": proxy}
+
+        def rotate(self) -> None:
+            if self._proxies:
+                self._cursor = (self._cursor + 1) % len(self._proxies)
+
+        def __bool__(self) -> bool:
+            return bool(self._proxies)
+
+    def load_proxy_list(path: Path) -> List[str]:
+        if not path.exists():
+            raise FileNotFoundError(f"Proxy list file not found: {path}")
+        proxies: List[str] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            trimmed = line.strip()
+            if not trimmed or trimmed.startswith('#'):
+                continue
+            proxies.append(trimmed)
+        return proxies
+
 DEFAULT_TIMEOUT = 15.0
 DEFAULT_DELAY = 1.0
+DEFAULT_PROXY_POOL = [
+    "http://159.89.132.167:8989",
+    "http://64.225.8.82:9988",
+    "http://45.79.17.203:3128",
+    "http://165.225.240.121:80",
+    "http://134.209.29.120:8080",
+]
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 RATIO_SCHEMA_VERSION = 2
 _UNIT_TAIL_PATTERN = re.compile(r"^(?P<value>.+?)\s*(?P<unit>[A-Za-z%]+\.?)$")
@@ -53,6 +94,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="Update every document even if KPIs already exist.")
     parser.add_argument("--standalone", dest="consolidated", action="store_false", help="Use standalone financial view instead of consolidated.")
     parser.set_defaults(consolidated=True)
+    parser.add_argument("--proxy-file", help="Path to newline-delimited HTTP/S proxies for rotation during scraping.")
+    parser.add_argument("--retry-delay-min", type=float, default=1.0, help="Minimum seconds to wait before retrying a failed slug.")
+    parser.add_argument("--retry-delay-max", type=float, default=2.0, help="Maximum seconds to wait before retrying a failed slug.")
+    parser.add_argument("--no-default-proxies", action="store_true", help="Disable the built-in fallback proxy pool.")
     parser.add_argument("--dry-run", action="store_true", help="Scrape KPIs but skip Mongo updates.")
     return parser.parse_args(argv)
 
@@ -102,9 +147,10 @@ def fetch_top_ratios_once(
     *,
     consolidated: bool,
     timeout: float,
+    proxies: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Dict[str, str]]:
     url = build_company_url(slug, consolidated)
-    response = session.get(url, headers=HEADERS, timeout=timeout)
+    response = session.get(url, headers=HEADERS, timeout=timeout, proxies=proxies)
     if response.status_code == 404:
         raise NotFoundError(f"Slug '{slug}' not found on Screener.")
     response.raise_for_status()
@@ -118,26 +164,54 @@ def fetch_top_ratios_with_retry(
     consolidated: bool,
     timeout: float,
     max_retries: int,
+    retry_delay: Tuple[float, float],
+    proxy_manager: Optional["ProxyManager"] = None,
 ) -> Dict[str, Dict[str, str]]:
+    min_wait, max_wait = retry_delay
+    min_wait = max(0.0, min_wait)
+    max_wait = max(min_wait, max_wait)
     attempt = 0
+    last_error: Optional[Exception] = None
+
     while attempt < max_retries:
+        proxies = proxy_manager.for_requests() if proxy_manager else None
         try:
-            return fetch_top_ratios_once(session, slug, consolidated=consolidated, timeout=timeout)
+            return fetch_top_ratios_once(
+                session,
+                slug,
+                consolidated=consolidated,
+                timeout=timeout,
+                proxies=proxies,
+            )
         except NotFoundError:
             raise
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
-            attempt += 1
-            if status not in RETRYABLE_STATUS_CODES or attempt >= max_retries:
+            if status is not None and status not in RETRYABLE_STATUS_CODES:
                 raise
-            delay = min(5.0, 0.5 * (2 ** attempt))
-            time.sleep(delay)
-        except requests.RequestException:
+            last_error = exc
             attempt += 1
-            if attempt >= max_retries:
-                raise
-            delay = min(5.0, 0.5 * (2 ** attempt))
-            time.sleep(delay)
+        except requests.RequestException as exc:
+            last_error = exc
+            attempt += 1
+
+        if attempt >= max_retries:
+            break
+
+        if proxy_manager and last_error is not None:
+            if isinstance(last_error, requests.RequestException):
+                proxy_manager.rotate()
+            elif isinstance(last_error, requests.HTTPError):
+                status = last_error.response.status_code if getattr(last_error, "response", None) is not None else None
+                if status == 429:
+                    proxy_manager.rotate()
+
+        wait_time = random.uniform(min_wait, max_wait) if max_wait > 0 else 0.0
+        if wait_time > 0:
+            time.sleep(wait_time)
+
+    if last_error is not None:
+        raise last_error
     raise RuntimeError(f"Failed to fetch ratios for slug '{slug}' after {max_retries} attempts.")
 
 
@@ -239,6 +313,26 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     client.admin.command("ping")
     collection = client[args.target_mongo_db][args.collection]
 
+    retry_delay_min = max(0.0, args.retry_delay_min)
+    retry_delay_max = max(retry_delay_min, args.retry_delay_max)
+
+    proxy_manager: Optional[ProxyManager] = None
+    if args.proxy_file:
+        proxy_path = Path(args.proxy_file)
+        try:
+            proxy_values = load_proxy_list(proxy_path)
+        except FileNotFoundError as exc:
+            print(f"Warning: {exc}")
+        else:
+            if proxy_values:
+                proxy_manager = ProxyManager(proxy_values)
+            else:
+                print(f"Warning: No usable proxies found in {proxy_path}")
+
+    if proxy_manager is None and not args.no_default_proxies and DEFAULT_PROXY_POOL:
+        proxy_manager = ProxyManager(DEFAULT_PROXY_POOL)
+        print("Info: Using built-in fallback proxy list (override with --proxy-file or --no-default-proxies).", file=sys.stderr)
+
     if args.force:
         query: Dict[str, Any] = {}
     else:
@@ -282,6 +376,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                         consolidated=args.consolidated,
                         timeout=args.timeout,
                         max_retries=max(1, args.max_retries),
+                        retry_delay=(retry_delay_min, retry_delay_max),
+                        proxy_manager=proxy_manager,
                     )
                     slug_used = candidate
                     break
@@ -298,6 +394,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 if not args.dry_run:
                     collection.update_one({"_id": doc["_id"]}, {"$set": update_doc})
                 print(f"[{processed}] Failed: {name} -> {update_doc['ratio_fetch_error']}")
+                if args.delay > 0:
+                    time.sleep(args.delay)
                 continue
 
             timestamp = datetime.now(timezone.utc)

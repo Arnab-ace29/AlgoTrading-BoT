@@ -54,6 +54,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
     "an": {"list_field": "announcement", "result_key": "announcement"},
     "bm": {"list_field": "board_meeting", "result_key": "board_meeting"},
     "d": {"list_field": "dividends", "result_key": "dividend"},
+    "b": {"list_field": "bonus", "result_key": "bonus"},
     "s": {"list_field": "splits", "result_key": "splits"},
     "r": {"list_field": "rights", "result_key": "rights"},
     "ae": {"list_field": "agm_egm", "result_key": "agm_egm"},

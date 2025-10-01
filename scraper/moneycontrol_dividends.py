@@ -1,5 +1,6 @@
 import argparse
 import json
+from datetime import datetime, timezone
 import string
 import time
 from pathlib import Path
@@ -54,6 +55,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
     "an": {"list_field": "announcement", "result_key": "announcement"},
     "bm": {"list_field": "board_meeting", "result_key": "board_meeting"},
     "d": {"list_field": "dividends", "result_key": "dividend"},
+    "b": {"list_field": "bonus", "result_key": "bonus"},
     "s": {"list_field": "splits", "result_key": "splits"},
     "r": {"list_field": "rights", "result_key": "rights"},
     "ae": {"list_field": "agm_egm", "result_key": "agm_egm"},
@@ -64,6 +66,11 @@ def throttle(duration: float) -> None:
     """Pause execution briefly so Moneycontrol's API is not overwhelmed."""
     if duration > 0:
         time.sleep(duration)
+
+
+def current_timestamp() -> str:
+    """Return the current UTC timestamp in ISO-8601 format."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def fetch_stock_metadata(session: requests.Session) -> Dict[str, Dict[str, object]]:
@@ -550,7 +557,10 @@ def filter_payload_by_stocks(payload: List[Dict[str, object]], stock_ids: Set[st
 
 def extract_metadata_from_entry(entry: Dict[str, object]) -> Dict[str, object]:
     """Build a metadata record from a corporate action entry."""
-    return {key: entry.get(key) for key in METADATA_EXPORT_KEYS if key in entry}
+    record = {key: entry.get(key) for key in METADATA_EXPORT_KEYS if key in entry}
+    if entry.get("lastUpdated"):
+        record["lastUpdated"] = entry["lastUpdated"]
+    return record
 
 
 def get_mongo_collections(args: argparse.Namespace) -> Tuple[Optional[MongoClient], Optional[Collection], Optional[Collection]]:
@@ -645,14 +655,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         if args.refresh_details and corporate_payload:
             metadata_updated = False
             for entry in corporate_payload:
-                if update_record_with_details(session, entry, force_refresh=True):
-                    metadata_updated = True
                 stock_id = entry.get("id")
+                updated = update_record_with_details(session, entry, force_refresh=True)
+                if updated:
+                    metadata_updated = True
                 if stock_id:
+                    entry.setdefault("lastUpdated", current_timestamp())
+                    metadata_snapshot = extract_metadata_from_entry(entry)
                     if stock_id not in metadata_records:
-                        metadata_records[stock_id] = extract_metadata_from_entry(entry)
+                        metadata_records[stock_id] = metadata_snapshot
                     else:
-                        metadata_records[stock_id].update(extract_metadata_from_entry(entry))
+                        metadata_records[stock_id].update(metadata_snapshot)
+                        metadata_records[stock_id]["lastUpdated"] = metadata_snapshot.get("lastUpdated", metadata_records[stock_id].get("lastUpdated"))
             if metadata_updated:
                 if metadata_records:
                     stock_metadata_path.write_text(
@@ -661,11 +675,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                     )
                 corporate_output_path.write_text(json.dumps(corporate_payload, indent=2), encoding="utf-8")
         elif not metadata_records and corporate_payload:
-            metadata_records = {
-                entry["id"]: extract_metadata_from_entry(entry)
-                for entry in corporate_payload
-                if entry.get("id")
-            }
+            metadata_records = {}
+            for entry in corporate_payload:
+                stock_id = entry.get("id")
+                if not stock_id:
+                    continue
+                entry.setdefault("lastUpdated", current_timestamp())
+                metadata_records[stock_id] = extract_metadata_from_entry(entry)
             if metadata_records:
                 stock_metadata_path.write_text(
                     json.dumps(list(metadata_records.values()), indent=2),
@@ -714,7 +730,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                         sections_payload[section_code] = prior_entry[section_code]
                     else:
                         sections_payload[section_code] = empty_section_payload(section_code)
-            corporate_payload.append(consolidated_entry(stock_info, sections_payload))
+            entry = consolidated_entry(stock_info, sections_payload)
+            entry["lastUpdated"] = current_timestamp()
+            corporate_payload.append(entry)
+            metadata_record = extract_metadata_from_entry(entry)
+            metadata_record.setdefault("lastUpdated", entry["lastUpdated"])
+            metadata_cache[stock_id] = metadata_record
             processed_ids.add(stock_id)
             if index % 25 == 0 and not requested_stock_ids:
                 print(f"Processed {index} stocks")
@@ -724,6 +745,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             if stock_id in processed_ids:
                 continue
             corporate_payload.append(prior_entry)
+            if stock_id not in metadata_cache and isinstance(prior_entry, dict):
+                metadata_cache[stock_id] = extract_metadata_from_entry(prior_entry)
 
         corporate_output_path.write_text(json.dumps(corporate_payload, indent=2), encoding="utf-8")
         stock_metadata_path.write_text(

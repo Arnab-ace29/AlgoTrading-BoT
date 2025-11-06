@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import requests
@@ -68,6 +68,99 @@ SECTION_COLLECTION_NAMES = {
 }
 
 SCRAPE_METADATA_COLLECTION = "scrape metadata"
+
+RATIO_SCHEMA_VERSION = 2
+_UNIT_TAIL_PATTERN = re.compile(r"^(?P<value>.+?)\s*(?P<unit>[A-Za-z%]+\.?)$")
+
+
+def _split_value_unit(text: str) -> Tuple[str, Optional[str]]:
+    stripped = text.strip()
+    if not stripped:
+        return "", None
+    match = _UNIT_TAIL_PATTERN.match(stripped)
+    if match:
+        value = match.group("value").strip()
+        unit = match.group("unit").strip()
+        return value, unit
+    return stripped, None
+
+
+def extract_top_ratios(soup: BeautifulSoup) -> Dict[str, Dict[str, str]]:
+    """Parse Screener's top ratios widget from a company page soup."""
+    ratios: Dict[str, Dict[str, str]] = {}
+    for item in soup.select("ul#top-ratios li"):
+        key_tag = item.find("span", class_="name")
+        val_tag = item.find("span", class_="number")
+        if not key_tag or not val_tag:
+            continue
+        key = key_tag.get_text(strip=True)
+        raw_val = val_tag.get_text(strip=True)
+        if not key or raw_val is None:
+            continue
+        value, unit = _split_value_unit(raw_val)
+        entry: Dict[str, str] = {"value": value, "raw": raw_val}
+        if unit:
+            entry["unit"] = unit
+        ratios[key] = entry
+    return ratios
+
+
+def _normalise_ratio_field(label: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", label).strip("_").lower()
+    if not slug:
+        slug = "ratio"
+    if slug[0].isdigit():
+        slug = f"ratio_{slug}"
+    return slug
+
+
+def _coerce_numeric(text: str) -> Optional[Any]:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    match = re.match(r"^[^\d\-\+]*([-+]?\d[\d,]*\.?\d*)\s*$", stripped)
+    if not match:
+        return None
+    token = match.group(1).replace(",", "")
+    try:
+        value = float(token)
+    except ValueError:
+        return None
+    if value.is_integer():
+        return int(value)
+    return value
+
+
+def flatten_ratios(
+    ratios: Dict[str, Dict[str, str]],
+) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, str], Dict[str, str]]:
+    values: Dict[str, Any] = {}
+    label_map: Dict[str, str] = {}
+    unit_map: Dict[str, str] = {}
+    raw_map: Dict[str, str] = {}
+    used: set[str] = set()
+
+    for label, entry in ratios.items():
+        base_field = _normalise_ratio_field(label)
+        candidate = base_field
+        suffix = 1
+        while candidate in used:
+            suffix += 1
+            candidate = f"{base_field}_{suffix}"
+        used.add(candidate)
+
+        value_text = entry.get("value", "").strip()
+        raw_text = entry.get("raw", value_text)
+        numeric = _coerce_numeric(value_text)
+        values[candidate] = numeric if numeric is not None else value_text
+        label_map[candidate] = label
+        raw_map[candidate] = raw_text
+        unit = entry.get("unit")
+        if unit:
+            unit_map[candidate] = unit
+
+    return values, label_map, unit_map, raw_map
+
 
 def build_company_key(bse: Optional[str], nse: Optional[str], isin: Optional[str]) -> Tuple[str, str, str]:
     """Generate a stable key for tracking per-company metadata in Mongo."""
@@ -626,24 +719,102 @@ class TargetMongo:
                 lookup[key] = timestamp
         return lookup
 
-    def record_company_scrape(self, metadata: Dict[str, object]) -> None:
+    def record_company_scrape(
+        self,
+        metadata: Dict[str, object],
+        *,
+        ratios: Optional[Dict[str, Dict[str, str]]] = None,
+        consolidated: bool,
+        slug: Optional[str],
+        ratio_error: Optional[str] = None,
+    ) -> None:
         """Persist the scrape timestamp for a company as soon as data lands."""
         if not self.enable_writes:
             return
         key = build_company_key(metadata.get("BSEID"), metadata.get("NSEID"), metadata.get("ISINID"))
-        document = {
+        filter_query = {
+            "BSEID": key[0],
+            "NSEID": key[1],
+            "ISINID": key[2],
+        }
+
+        previous_fields: List[str] = []
+        try:
+            existing = self.metadata_collection.find_one(filter_query, {"_id": 0, "ratio_fields": 1})
+        except Exception:
+            existing = None
+        if existing and isinstance(existing.get("ratio_fields"), list):
+            previous_fields = [field for field in existing["ratio_fields"] if isinstance(field, str)]
+
+        timestamp = datetime.now(timezone.utc)
+        set_doc: Dict[str, Any] = {
             "BSEID": key[0],
             "NSEID": key[1],
             "ISINID": key[2],
             "Company Name": metadata.get("Company Name", ""),
             "Resolved Slug": metadata.get("Resolved Slug", ""),
-            "updated_at": datetime.now(timezone.utc),
+            "Slug Source": metadata.get("Slug Source", ""),
+            "Company ID": metadata.get("Company ID", ""),
+            "Index": metadata.get("Index", ""),
+            "updated_at": timestamp,
         }
-        self.metadata_collection.replace_one({
-            "BSEID": key[0],
-            "NSEID": key[1],
-            "ISINID": key[2],
-        }, document, upsert=True)
+        unset_doc: Dict[str, str] = {}
+
+        if ratios is None:
+            if ratio_error:
+                set_doc["ratio_fetch_error"] = ratio_error
+            update_body: Dict[str, Dict[str, Any]] = {"$set": set_doc}
+            if not ratio_error:
+                unset_doc["ratio_fetch_error"] = ""
+            if unset_doc:
+                update_body["$unset"] = unset_doc
+            self.metadata_collection.update_one(filter_query, update_body, upsert=True)
+            return
+
+        value_map, label_map, unit_map, raw_map = flatten_ratios(ratios)
+        ratio_fields = sorted(value_map.keys())
+        set_doc.update(value_map)
+        set_doc.update(
+            {
+                "ratio_fields": ratio_fields,
+                "ratio_field_map": label_map,
+                "ratio_updated_at": timestamp,
+                "ratio_slug": slug or metadata.get("Resolved Slug", ""),
+                "ratio_view": "consolidated" if consolidated else "standalone",
+                "ratio_schema_version": RATIO_SCHEMA_VERSION,
+            }
+        )
+
+        if unit_map:
+            set_doc["ratio_units"] = unit_map
+        else:
+            unset_doc["ratio_units"] = ""
+
+        if raw_map:
+            set_doc["ratio_raw_values"] = raw_map
+        else:
+            unset_doc["ratio_raw_values"] = ""
+
+        if ratio_error:
+            set_doc["ratio_fetch_error"] = ratio_error
+        else:
+            unset_doc["ratio_fetch_error"] = ""
+
+        if not ratio_fields:
+            for field in previous_fields:
+                unset_doc[field] = ""
+        else:
+            for field in previous_fields:
+                if field not in ratio_fields:
+                    unset_doc[field] = ""
+
+        unset_doc["top_ratios"] = ""
+        unset_doc["top_ratios_error"] = ""
+
+        update_body = {"$set": set_doc}
+        if unset_doc:
+            update_body["$unset"] = unset_doc
+        self.metadata_collection.update_one(filter_query, update_body, upsert=True)
 
 
 def read_index_file(path: Path) -> Sequence[object]:
@@ -937,6 +1108,12 @@ def scrape_company(
                 if not tables:
                     raise ValueError("No tables found on Screener page.")
                 resolved_slug = extract_slug_from_url(final_url)
+                top_ratios: Optional[Dict[str, Dict[str, str]]] = None
+                ratio_error: Optional[str] = None
+                try:
+                    top_ratios = extract_top_ratios(soup)
+                except Exception as exc:  # pragma: no cover - unexpected HTML changes
+                    ratio_error = f"{type(exc).__name__}: {exc}"
                 metadata = {
                     "Index": index_name,
                     "Company Name": target.name,
@@ -950,7 +1127,13 @@ def scrape_company(
                 for section_name, df in tables.items():
                     append_section_results(section_name, df, metadata, results_dir, target_mongo)
                 if target_mongo is not None:
-                    target_mongo.record_company_scrape(metadata)
+                    target_mongo.record_company_scrape(
+                        metadata,
+                        ratios=top_ratios,
+                        consolidated=consolidated,
+                        slug=resolved_slug,
+                        ratio_error=ratio_error,
+                    )
                 return True
             except HTTPError as exc:
                 last_error = exc

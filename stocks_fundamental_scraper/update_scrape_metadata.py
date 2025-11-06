@@ -26,6 +26,9 @@ try:  # Prefer shared constants when scrape_screener is importable
         DEFAULT_TARGET_MONGO_DB,
         ProxyManager,
         load_proxy_list,
+        extract_top_ratios as scrape_extract_top_ratios,
+        flatten_ratios as scrape_flatten_ratios,
+        RATIO_SCHEMA_VERSION as SCRAPER_RATIO_SCHEMA_VERSION,
     )
 except ImportError:  # Fallback when executed standalone
     BASE_URL = "https://www.screener.in"
@@ -63,6 +66,97 @@ except ImportError:  # Fallback when executed standalone
             proxies.append(trimmed)
         return proxies
 
+    _UNIT_TAIL_PATTERN = re.compile(r"^(?P<value>.+?)\s*(?P<unit>[A-Za-z%]+\.?)$")
+
+    def _split_value_unit(text: str) -> Tuple[str, Optional[str]]:
+        stripped = text.strip()
+        if not stripped:
+            return "", None
+        match = _UNIT_TAIL_PATTERN.match(stripped)
+        if match:
+            value = match.group("value").strip()
+            unit = match.group("unit").strip()
+            return value, unit
+        return stripped, None
+
+    def extract_top_ratios(soup: BeautifulSoup) -> Dict[str, Dict[str, str]]:
+        ratios: Dict[str, Dict[str, str]] = {}
+        for item in soup.select("ul#top-ratios li"):
+            key_tag = item.find("span", class_="name")
+            val_tag = item.find("span", class_="number")
+            if not key_tag or not val_tag:
+                continue
+            key = key_tag.get_text(strip=True)
+            raw_val = val_tag.get_text(strip=True)
+            if not key or raw_val is None:
+                continue
+            value, unit = _split_value_unit(raw_val)
+            entry: Dict[str, str] = {"value": value, "raw": raw_val}
+            if unit:
+                entry["unit"] = unit
+            ratios[key] = entry
+        return ratios
+
+    def _normalise_ratio_field(label: str) -> str:
+        slug = re.sub(r"[^0-9A-Za-z]+", "_", label).strip("_").lower()
+        if not slug:
+            slug = "ratio"
+        if slug[0].isdigit():
+            slug = f"ratio_{slug}"
+        return slug
+
+    def _coerce_numeric(text: str) -> Optional[Any]:
+        stripped = text.strip()
+        if not stripped:
+            return None
+        match = re.match(r"^[^\d\-\+]*([-+]?\d[\d,]*\.?\d*)\s*$", stripped)
+        if not match:
+            return None
+        token = match.group(1).replace(",", "")
+        try:
+            value = float(token)
+        except ValueError:
+            return None
+        if value.is_integer():
+            return int(value)
+        return value
+
+    def flatten_ratios(
+        ratios: Dict[str, Dict[str, str]],
+    ) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, str], Dict[str, str]]:
+        values: Dict[str, Any] = {}
+        label_map: Dict[str, str] = {}
+        unit_map: Dict[str, str] = {}
+        raw_map: Dict[str, str] = {}
+        used: set[str] = set()
+
+        for label, entry in ratios.items():
+            base_field = _normalise_ratio_field(label)
+            candidate = base_field
+            suffix = 1
+            while candidate in used:
+                suffix += 1
+                candidate = f"{base_field}_{suffix}"
+            used.add(candidate)
+
+            value_text = entry.get("value", "").strip()
+            raw_text = entry.get("raw", value_text)
+            numeric = _coerce_numeric(value_text)
+            values[candidate] = numeric if numeric is not None else value_text
+            label_map[candidate] = label
+            raw_map[candidate] = raw_text
+            unit = entry.get("unit")
+            if unit:
+                unit_map[candidate] = unit
+
+        return values, label_map, unit_map, raw_map
+
+    RATIO_SCHEMA_VERSION = 2
+else:
+    extract_top_ratios = scrape_extract_top_ratios
+    flatten_ratios = scrape_flatten_ratios
+    RATIO_SCHEMA_VERSION = SCRAPER_RATIO_SCHEMA_VERSION
+
 DEFAULT_TIMEOUT = 15.0
 DEFAULT_DELAY = 1.0
 DEFAULT_PROXY_POOL = [
@@ -73,8 +167,6 @@ DEFAULT_PROXY_POOL = [
     "http://134.209.29.120:8080",
 ]
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-RATIO_SCHEMA_VERSION = 2
-_UNIT_TAIL_PATTERN = re.compile(r"^(?P<value>.+?)\s*(?P<unit>[A-Za-z%]+\.?)$")
 
 
 class NotFoundError(RuntimeError):
@@ -109,36 +201,9 @@ def build_company_url(slug: str, consolidated: bool) -> str:
     return f"{BASE_URL}/company/{slug}"
 
 
-def _split_value_unit(text: str) -> Tuple[str, Optional[str]]:
-    stripped = text.strip()
-    if not stripped:
-        return "", None
-    match = _UNIT_TAIL_PATTERN.match(stripped)
-    if match:
-        value = match.group("value").strip()
-        unit = match.group("unit").strip()
-        return value, unit
-    return stripped, None
-
-
 def parse_top_ratios(html: str) -> Dict[str, Dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
-    ratios: Dict[str, Dict[str, str]] = {}
-    for item in soup.select("ul#top-ratios li"):
-        key_tag = item.find("span", class_="name")
-        val_tag = item.find("span", class_="number")
-        if not key_tag or not val_tag:
-            continue
-        key = key_tag.get_text(strip=True)
-        raw_val = val_tag.get_text(strip=True)
-        if not key or raw_val is None:
-            continue
-        value, unit = _split_value_unit(raw_val)
-        entry: Dict[str, str] = {"value": value, "raw": raw_val}
-        if unit:
-            entry["unit"] = unit
-        ratios[key] = entry
-    return ratios
+    return extract_top_ratios(soup)
 
 
 def fetch_top_ratios_once(
@@ -249,61 +314,6 @@ def slug_candidates(doc: dict, slug_field: str) -> Iterator[str]:
             continue
         seen.add(candidate)
         yield candidate
-
-
-def _normalise_ratio_field(label: str) -> str:
-    slug = re.sub(r"[^0-9A-Za-z]+", "_", label).strip("_").lower()
-    if not slug:
-        slug = "ratio"
-    if slug[0].isdigit():
-        slug = f"ratio_{slug}"
-    return slug
-
-
-def _coerce_numeric(text: str) -> Optional[Any]:
-    stripped = text.strip()
-    if not stripped:
-        return None
-    match = re.match(r"^[^\d\-\+]*([-+]?\d[\d,]*\.?\d*)\s*$", stripped)
-    if not match:
-        return None
-    token = match.group(1).replace(",", "")
-    try:
-        value = float(token)
-    except ValueError:
-        return None
-    if value.is_integer():
-        return int(value)
-    return value
-
-
-def flatten_ratios(ratios: Dict[str, Dict[str, str]]) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, str], Dict[str, str]]:
-    values: Dict[str, Any] = {}
-    label_map: Dict[str, str] = {}
-    unit_map: Dict[str, str] = {}
-    raw_map: Dict[str, str] = {}
-    used: set[str] = set()
-
-    for label, entry in ratios.items():
-        base_field = _normalise_ratio_field(label)
-        candidate = base_field
-        suffix = 1
-        while candidate in used:
-            suffix += 1
-            candidate = f"{base_field}_{suffix}"
-        used.add(candidate)
-
-        value_text = entry.get("value", "").strip()
-        raw_text = entry.get("raw", value_text)
-        numeric = _coerce_numeric(value_text)
-        values[candidate] = numeric if numeric is not None else value_text
-        label_map[candidate] = label
-        raw_map[candidate] = raw_text
-        unit = entry.get("unit")
-        if unit:
-            unit_map[candidate] = unit
-
-    return values, label_map, unit_map, raw_map
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:

@@ -648,6 +648,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     corporate_payload: List[Dict[str, object]] = []
     payload_for_push: List[Dict[str, object]] = []
+    incremental_push_done = False
 
     if args.push_only:
         corporate_payload = load_corporate_payload(corporate_output_path, corporate_collection)
@@ -655,18 +656,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         if args.refresh_details and corporate_payload:
             metadata_updated = False
             for entry in corporate_payload:
-                stock_id = entry.get("id")
-                updated = update_record_with_details(session, entry, force_refresh=True)
-                if updated:
+                if update_record_with_details(session, entry, force_refresh=True):
                     metadata_updated = True
+                stock_id = entry.get("id")
                 if stock_id:
-                    entry.setdefault("lastUpdated", current_timestamp())
-                    metadata_snapshot = extract_metadata_from_entry(entry)
                     if stock_id not in metadata_records:
-                        metadata_records[stock_id] = metadata_snapshot
+                        metadata_records[stock_id] = extract_metadata_from_entry(entry)
                     else:
-                        metadata_records[stock_id].update(metadata_snapshot)
-                        metadata_records[stock_id]["lastUpdated"] = metadata_snapshot.get("lastUpdated", metadata_records[stock_id].get("lastUpdated"))
+                        metadata_records[stock_id].update(extract_metadata_from_entry(entry))
             if metadata_updated:
                 if metadata_records:
                     stock_metadata_path.write_text(
@@ -704,6 +701,78 @@ def main(argv: Optional[List[str]] = None) -> None:
         existing_by_id = load_existing_output(corporate_output_path, corporate_collection)
         processed_ids: Set[str] = set()
 
+        pending_corporate_docs: List[Dict[str, object]] = []
+        pending_metadata_records: Dict[str, Dict[str, object]] = {}
+        pushed_corporate = False
+        pushed_metadata = False
+
+        def should_include_stock(stock_id: Optional[str]) -> bool:
+            return bool(stock_id) and (not requested_stock_ids or stock_id in requested_stock_ids)
+
+        def flush_corporate(force: bool = False) -> None:
+            nonlocal pushed_corporate
+            if (
+                not args.push_to_mongo
+                or mongo_client is None
+                or not pending_corporate_docs
+                or (not force and len(pending_corporate_docs) < args.chunk_size)
+            ):
+                return
+            push_documents_to_mongo(
+                pending_corporate_docs,
+                mongo_client,
+                args.mongo_db,
+                args.mongo_collection,
+                args.chunk_size,
+            )
+            pending_corporate_docs.clear()
+            pushed_corporate = True
+
+        def flush_metadata(force: bool = False) -> None:
+            nonlocal pushed_metadata
+            if (
+                not args.push_to_mongo
+                or mongo_client is None
+                or not pending_metadata_records
+                or (not force and len(pending_metadata_records) < args.chunk_size)
+            ):
+                return
+            push_metadata_to_mongo(
+                pending_metadata_records,
+                mongo_client,
+                args.mongo_db,
+                args.mongo_metadata_collection,
+                args.chunk_size,
+            )
+            pending_metadata_records.clear()
+            pushed_metadata = True
+
+        def queue_for_push(entry: Dict[str, object], stock_id: Optional[str]) -> None:
+            if (
+                not args.push_to_mongo
+                or mongo_client is None
+                or not should_include_stock(stock_id)
+                or not isinstance(entry, dict)
+            ):
+                return
+            pending_corporate_docs.append(entry)
+            flush_corporate()
+            if stock_id:
+                record = metadata_cache.get(stock_id)
+                if record:
+                    pending_metadata_records[stock_id] = record
+                    flush_metadata()
+
+        if args.push_to_mongo and mongo_client is not None:
+            print(
+                f"Streaming corporate action updates to MongoDB collection "
+                f"{args.mongo_db}.{args.mongo_collection} in chunks of {args.chunk_size}"
+            )
+            print(
+                f"Streaming metadata updates to MongoDB collection "
+                f"{args.mongo_db}.{args.mongo_metadata_collection} in chunks of {args.chunk_size}"
+            )
+
         for index, (stock_id, stock_info) in enumerate(stocks_to_process.items(), start=1):
             prior_entry = existing_by_id.get(stock_id)
             update_record_with_details(
@@ -730,12 +799,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                         sections_payload[section_code] = prior_entry[section_code]
                     else:
                         sections_payload[section_code] = empty_section_payload(section_code)
-            entry = consolidated_entry(stock_info, sections_payload)
-            entry["lastUpdated"] = current_timestamp()
-            corporate_payload.append(entry)
-            metadata_record = extract_metadata_from_entry(entry)
-            metadata_record.setdefault("lastUpdated", entry["lastUpdated"])
-            metadata_cache[stock_id] = metadata_record
+            corporate_payload.append(consolidated_entry(stock_info, sections_payload))
             processed_ids.add(stock_id)
             if index % 25 == 0 and not requested_stock_ids:
                 print(f"Processed {index} stocks")
@@ -745,8 +809,6 @@ def main(argv: Optional[List[str]] = None) -> None:
             if stock_id in processed_ids:
                 continue
             corporate_payload.append(prior_entry)
-            if stock_id not in metadata_cache and isinstance(prior_entry, dict):
-                metadata_cache[stock_id] = extract_metadata_from_entry(prior_entry)
 
         corporate_output_path.write_text(json.dumps(corporate_payload, indent=2), encoding="utf-8")
         stock_metadata_path.write_text(
@@ -754,9 +816,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             encoding="utf-8",
         )
 
+        if args.push_to_mongo and mongo_client is not None:
+            flush_corporate(force=True)
+            flush_metadata(force=True)
+            incremental_push_done = pushed_corporate or pushed_metadata
         payload_for_push = filter_payload_by_stocks(corporate_payload, requested_stock_ids)
 
-    if args.push_to_mongo:
+    if args.push_to_mongo and not incremental_push_done:
         if not payload_for_push:
             payload_for_push = filter_payload_by_stocks(corporate_payload, requested_stock_ids)
         if not payload_for_push:

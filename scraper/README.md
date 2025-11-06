@@ -12,7 +12,7 @@ This scraper pulls comprehensive corporate data for every stock listed on Moneyc
 2. Refresh symbol metadata (`--refresh-metadata`) or identifier details (`--refresh-details`) when required.
 3. Incrementally fetch corporate-action sections, stopping once processed items overlap the cached data.
 4. Normalise section payloads so each stores a single list (e.g. `d["dividend"]` only) to avoid duplication.
-5. Persist outputs to JSON (as a portable backup) and/or MongoDB (canonical store).
+5. Persist outputs to JSON (as a portable backup) and/or MongoDB (canonical store), streaming Mongo upserts in `chunk-size` batches during the scrape to minimise data loss if the run is interrupted.
 
 ## CLI Reference
 Run `python moneycontrol_dividends.py [flags]` from the `scraper/` directory. All flags are optional.
@@ -37,7 +37,7 @@ Run `python moneycontrol_dividends.py [flags]` from the `scraper/` directory. Al
 ```bash
 python moneycontrol_dividends.py --refresh-metadata --refresh-details --push-to-mongo
 ```
-Uploads all corporate actions and metadata to MongoDB while updating the JSON backups.
+Uploads all corporate actions and metadata to MongoDB while updating the JSON backups. Mongo writes are streamed in chunks as soon as each batch is scraped, so partial runs still save their progress.
 
 ### Daily Incremental Run
 ```bash
@@ -111,6 +111,11 @@ No. Keys like SC_ISINID are stored without the prefix (e.g. ISINID) for easier q
 - `Historic Data/moneycontrol_corporate_actions.json`
 
 These remain as portable snapshots; the scraper still works on a clean machine by reading directly from MongoDB.
+
+## Streaming Mongo Writes
+- When `--push-to-mongo` is supplied during a scrape, documents are queued and flushed to Mongo as soon as each `chunk-size` batch finishes.
+- Both corporate-action payloads and metadata records flush independently, so a crash or manual stop preserves everything processed up to that point.
+- Remaining queued items are force-flushed before exit, and the legacy end-of-run push is skipped once streaming succeeded to avoid duplicate writes.
 
 ## MongoDB Notes
 - Two collections are used: `corporate_actions` and `stock_metadata` (configurable via flags).
